@@ -217,7 +217,7 @@ def main() -> int:
             class_name = json.load(f).get("_class_name", "")
             
     VIDEO_CLASSES = [
-        "LTXVideoPipeline", "MiniMaxH3ModularPipeline", "WanPipeline", "CogVideoXPipeline"
+        "LTX2Pipeline", "MiniMaxH3ModularPipeline", "WanPipeline", "CogVideoXPipeline"
     ]
     is_video = class_name in VIDEO_CLASSES
 

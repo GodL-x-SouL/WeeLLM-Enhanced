@@ -50,12 +50,12 @@ __all__ = [
     "LongCatImageTransformer2DModelStreamer",
     "LTX2ConnectorsStreamer",
     "LTX2DiTModelStreamer",
-    "LTX2GemmaStreamer",
     "MiniMaxH3Transformer3DModelStreamer",
     # Text Encoders
     "ChatGLMModelStreamer",
     "CLIPTextModelStreamer",
     "Gemma2ModelStreamer",
+    "Gemma4UnifiedForConditionalGenerationStreamer",
     "GlmModelStreamer",
     "LlamaForCausalLMStreamer",
     "Mistral3ForConditionalGenerationStreamer",
@@ -99,13 +99,13 @@ from .models.transformers.krea2_transformer_2d_model import Krea2Transformer2DMo
 from .models.transformers.longcat_transformer_2d_model import LongCatImageTransformer2DModelStreamer  # noqa: E402
 from .models.transformers.ltx2_connectors import LTX2ConnectorsStreamer  # noqa: E402
 from .models.transformers.ltx2_dit_model import LTX2DiTModelStreamer  # noqa: E402
-from .models.transformers.ltx2_gemma_streamer import LTX2GemmaStreamer  # noqa: E402
 from .models.transformers.minimax_h3_transformer_3d_model import MiniMaxH3Transformer3DModelStreamer  # noqa: E402
 
 # Text Encoders
 from .models.text_encoders.chatglm_model import ChatGLMModelStreamer  # noqa: E402
 from .models.text_encoders.clip_text_model import CLIPTextModelStreamer  # noqa: E402
 from .models.text_encoders.gemma2_model import Gemma2ModelStreamer  # noqa: E402
+from .models.text_encoders.gemma4_unified_for_conditional_generation import Gemma4UnifiedForConditionalGenerationStreamer  # noqa: E402
 from .models.text_encoders.glm_model import GlmModelStreamer  # noqa: E402
 from .models.text_encoders.llama_for_causal_lm import LlamaForCausalLMStreamer  # noqa: E402
 from .models.text_encoders.mistral3_for_conditional_generation import Mistral3ForConditionalGenerationStreamer  # noqa: E402

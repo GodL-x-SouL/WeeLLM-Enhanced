@@ -23,8 +23,10 @@ class WeeMiniMaxPipeline(WeeVideoPipeline):
         for _comp_name in _CALLABLE_COMPONENT_NAMES:
             if getattr(self._pipeline, _comp_name, None) is None:
                 if _comp_name == "audio_scheduler":
-                    # Just reuse the video scheduler for dummy audio scheduling
-                    setattr(self._pipeline, _comp_name, self._pipeline.scheduler)
+                    # Must instantiate a fresh scheduler from config so they don't share state
+                    # and don't carry the WeeLLM patched closures from the video scheduler!
+                    new_scheduler = self._pipeline.scheduler.__class__.from_config(self._pipeline.scheduler.config)
+                    setattr(self._pipeline, _comp_name, new_scheduler)
                 else:
                     class DummyComponent:
                         config = type('DummyConfig', (), {'latent_channels': 32, 'sampling_rate': 32000})()

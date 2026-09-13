@@ -50,7 +50,7 @@ _TE_MAP = {
     "LlamaForCausalLM":                       "weellm.models.text_encoders.llama_for_causal_lm",
     "ChatGLMModel":                           "weellm.models.text_encoders.chatglm_model",
     "Mistral3Model":                          "weellm.models.text_encoders.mistral3_model",
-    "Gemma4UnifiedForConditionalGeneration":  "weellm.models.transformers.ltx2_gemma_streamer",
+    "Gemma4UnifiedForConditionalGeneration":  "weellm.models.text_encoders.gemma4_unified_for_conditional_generation",
     "LTX2TextConnectors":                     "weellm.models.transformers.ltx2_connectors",
 }
 

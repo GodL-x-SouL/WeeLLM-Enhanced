@@ -33,7 +33,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                 class_name = json.load(f).get("_class_name", "")
                 
         VIDEO_MODELS = {
-            "LTXVideoPipeline": {
+            "LTX2Pipeline": {
                 "log": "Text-to-Video (LTX-2.5)",
                 "module": "weellm.pipelines.video.ltx_video_pipeline",
                 "class": "WeeLTX2Pipeline",
