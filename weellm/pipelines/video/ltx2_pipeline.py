@@ -120,3 +120,26 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 
         # 3. Delegate to the shared generic video generation loop in the base class
         return super().__call__(prompt=prompt, **kwargs)
+
+    def _preprocess_latents_for_decode(self, latents, vae, kwargs):
+        """
+        LTX-2.5 specific latent preprocessing.
+        LTX latents are pre-scaled, so we skip standard scaling/shifting.
+        We also handle the optional latent upsampler here.
+        """
+        latent_upsampler = kwargs.get("latent_upsampler", None)
+        if latent_upsampler:
+            logger.info("Upsampling latents using %s", latent_upsampler)
+            from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+            
+            _dev = latents.device
+            _dtype = vae.dtype if vae else latents.dtype
+            
+            _ups_model = LTX2LatentUpsamplerModel.from_pretrained(latent_upsampler).to(device=_dev, dtype=_dtype)
+            with torch.no_grad():
+                latents = _ups_model(latents)
+            del _ups_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        return latents

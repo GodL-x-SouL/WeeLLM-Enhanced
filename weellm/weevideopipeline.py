@@ -15,6 +15,48 @@ from weellm.weebasepipeline import WeeBasePipeline
 
 logger = logging.getLogger("weellm")
 
+class WeeVideoResult:
+    """
+    A unified wrapper for generated video frames and audio (if any),
+    mimicking the PIL.Image experience for video generation.
+    """
+    def __init__(self, frames, audio=None, default_fps=24, audio_rate=48000):
+        self.frames = frames
+        self.audio = audio
+        self.default_fps = default_fps
+        self.audio_rate = audio_rate
+
+    def save(self, filepath: str, fps: int = None, **kwargs):
+        final_fps = fps if fps is not None else self.default_fps
+        
+        try:
+            from diffusers.utils import encode_video
+            has_encode = True
+        except ImportError:
+            has_encode = False
+            
+        if has_encode and self.audio is not None:
+            # Format audio correctly (typically requires float CPU tensor)
+            _audio = self.audio
+            if isinstance(_audio, torch.Tensor):
+                _audio = _audio.float().cpu()
+                if _audio.dim() > 2 and _audio.shape[0] == 1:
+                    _audio = _audio[0] # [channels, length]
+            
+            encode_video(
+                self.frames,
+                fps=final_fps,
+                output_path=filepath,
+                audio=_audio,
+                audio_sample_rate=self.audio_rate,
+                **kwargs
+            )
+        else:
+            from diffusers.utils import export_to_video
+            export_to_video(self.frames, output_video_path=filepath, fps=final_fps)
+            
+        logger.info(f"Video saved to {filepath} at {final_fps} FPS.")
+
 class WeeVideoPipeline(WeeBasePipeline):
     
     @classmethod
@@ -35,7 +77,7 @@ class WeeVideoPipeline(WeeBasePipeline):
         VIDEO_MODELS = {
             "LTX2Pipeline": {
                 "log": "Text-to-Video (LTX-2.5)",
-                "module": "weellm.pipelines.video.ltx_video_pipeline",
+                "module": "weellm.pipelines.video.ltx2_pipeline",
                 "class": "WeeLTX2Pipeline",
             },
             "MiniMaxH3ModularPipeline": {
@@ -68,7 +110,21 @@ class WeeVideoPipeline(WeeBasePipeline):
             
         return super().from_pretrained(model_dir, **kwargs)
 
-    def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None):
+    def _preprocess_latents_for_decode(self, latents, vae, kwargs):
+        """
+        Hook for model-specific latent preprocessing before VAE decode.
+        Base implementation handles standard diffusers scaling/shifting.
+        """
+        if hasattr(vae, "config"):
+            _scaling = getattr(vae.config, "scaling_factor", 1.0)
+            _shift = getattr(vae.config, "shift_factor", 0.0)
+            
+            if _scaling != 1.0 or _shift != 0.0:
+                latents = (latents / _scaling) - _shift
+                
+        return latents
+
+    def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None):
         from weellm.helpers.video_cache import VideoStepCache
         if cache_root is None:
             cache_root = os.path.join(
@@ -81,6 +137,7 @@ class WeeVideoPipeline(WeeBasePipeline):
             num_frames=num_frames,
             steps=steps,
             seed=seed,
+            lora_weights=lora_weights,
             save_every=save_every,
             cache_root=cache_root,
         )
@@ -96,6 +153,10 @@ class WeeVideoPipeline(WeeBasePipeline):
         cache_every = kwargs.pop("cache_every", 1)
         fresh = kwargs.pop("fresh", False)
         
+        lora_weights = kwargs.pop("lora_weights", None)
+        latent_upsampler = kwargs.pop("latent_upsampler", None)
+        user_output_type = kwargs.get("output_type", "pil")
+        
         generator = kwargs.get("generator")
         seed = kwargs.pop("seed", generator.initial_seed() if generator is not None else 42)
         
@@ -109,11 +170,10 @@ class WeeVideoPipeline(WeeBasePipeline):
             return super().__call__(**kwargs)
 
         _video_cache = self._setup_cache(
-            prompt, height, width, num_frames, steps, seed, save_every=cache_every
+            prompt, height, width, num_frames, steps, seed, save_every=cache_every, lora_weights=lora_weights
         )
         if fresh:
             _video_cache.clear_run()
-        kwargs["_video_cache"] = _video_cache
         
         # Intercept encode_prompt
         _underlying = getattr(self, "_pipeline", self)
@@ -237,6 +297,23 @@ class WeeVideoPipeline(WeeBasePipeline):
         _pipe_call = getattr(_underlying, "__call__", None) or _underlying.__class__.__call__
         if "output_type" in inspect.signature(_pipe_call).parameters:
             kwargs.setdefault("output_type", "latent")
+            
+        if lora_weights is not None:
+            logger.info(f"Loading LoRA weights from {lora_weights}")
+            
+            from weellm.models.loras.lora_loader import GenericLazyLoRALoader
+            lazy_loader = GenericLazyLoRALoader(lora_weights)
+            
+            # 1. Apply to Transformer
+            _tr_model = getattr(_underlying, "transformer", None) or getattr(_underlying, "unet", None)
+            if _tr_model is not None:
+                # The shard name for the whole transformer can just be "transformer"
+                lazy_loader.apply_to_module(_tr_model, "transformer")
+                
+            # 2. Apply to Connectors if they exist
+            _conn_model = getattr(_underlying, "connectors", None)
+            if _conn_model is not None:
+                lazy_loader.apply_to_module(_conn_model, "connectors")
 
         if _video_cache.has_final():
             logger.info("[VideoCache] Final-latents cache HIT — running decode-only.")
@@ -259,17 +336,15 @@ class WeeVideoPipeline(WeeBasePipeline):
                     _lat = _cached_latents.to(device=_dev, dtype=_vae.dtype)
                     
                     if hasattr(_vae, "config"):
-                        _scaling = getattr(_vae.config, "scaling_factor", 1.0)
-                        _shift = getattr(_vae.config, "shift_factor", 0.0)
-                        if _scaling != 1.0 or _shift != 0.0:
-                            _lat = (_lat / _scaling) - _shift
+                        _lat = self._preprocess_latents_for_decode(_lat, _vae, kwargs)
+                            
                             
                     with torch.no_grad():
                         _decoded = _vae.decode(_lat, return_dict=False)[0]
                         _video = _vproc.postprocess_video(_decoded, output_type="pil") if _vproc else _decoded
                         
                     class _CachedOutput:
-                        frames = [_video]
+                        frames = _video
                         audio = None
                         sampling_rate = 24000
                     return _CachedOutput()
@@ -281,11 +356,62 @@ class WeeVideoPipeline(WeeBasePipeline):
                 kwargs["callback_on_step_end"] = _video_cache.get_step_callback()
                 return super().__call__(**kwargs)
 
-        kwargs["callback_on_step_end"] = _video_cache.get_step_callback()
-        
-        # ModularPipelines don't support callback_on_step_end or _video_cache natively
+        # Check for intermediate step cache
+        resume_step = -1
+        resume_latents = None
+        if not fresh and not _video_cache.has_final():
+            latest_file = _video_cache.latest_step_file()
+            if latest_file is not None:
+                resume_step = _video_cache.step_from_file(latest_file)
+                resume_latents = _video_cache.load_step(latest_file)
+                logger.info(f"[VideoCache] Resuming from step {resume_step}!")
+
+                class SkipDenoisingWrapper:
+                    def __init__(self, original, r_step):
+                        self.original = original
+                        self.resume_step = r_step
+                        self.current_step = 0
+                    def __getattr__(self, name):
+                        return getattr(self.original, name)
+                    def __call__(self, *args, **kw):
+                        if self.current_step <= self.resume_step:
+                            logger.info(f"[VideoCache] Fast-forwarding step {self.current_step}")
+                            self.current_step += 1
+                            latents = kw.get("hidden_states", args[0] if len(args) > 0 else None)
+                            if latents is None: latents = kw.get("sample", None)
+                            dummy = torch.zeros_like(latents) if latents is not None else None
+                            
+                            ret_dict = kw.get("return_dict", True)
+                            if "audio_hidden_states" in kw and kw["audio_hidden_states"] is not None:
+                                audio_dummy = torch.zeros_like(kw["audio_hidden_states"])
+                                if not ret_dict: return (dummy, audio_dummy)
+                                class DummyOut:
+                                    sample = dummy
+                                    audio_sample = audio_dummy
+                                    def __getitem__(self, idx): return (self.sample, self.audio_sample)[idx]
+                                return DummyOut()
+                                
+                            if not ret_dict: return (dummy,)
+                            class DummyOut:
+                                sample = dummy
+                                def __getitem__(self, idx): return (self.sample,)[idx]
+                            return DummyOut()
+                            
+                        self.current_step += 1
+                        return self.original(*args, **kw)
+                
+                if hasattr(_underlying, "transformer"):
+                    _underlying.transformer = SkipDenoisingWrapper(_underlying.transformer, resume_step)
+                elif hasattr(_underlying, "unet"):
+                    _underlying.unet = SkipDenoisingWrapper(_underlying.unet, resume_step)
+
+        if resume_step >= 0:
+            kwargs["callback_on_step_end"] = _video_cache.get_step_callback(resume_step=resume_step, resume_latents=resume_latents)
+        else:
+            kwargs["callback_on_step_end"] = _video_cache.get_step_callback()
+            
+        # ModularPipelines don't support callback_on_step_end natively
         if hasattr(_underlying, "_blocks"):
-            kwargs.pop("_video_cache", None)
             kwargs.pop("callback_on_step_end", None)
             
         out = super().__call__(**kwargs)
@@ -310,11 +436,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                     _dev = torch.device(str(self.device))
                     _lat = out.frames.to(device=_dev, dtype=_vae.dtype)
                     
-                    if hasattr(_vae, "config"):
-                        _scaling = getattr(_vae.config, "scaling_factor", 1.0)
-                        _shift = getattr(_vae.config, "shift_factor", 0.0)
-                        if _scaling != 1.0 or _shift != 0.0:
-                            _lat = (_lat / _scaling) - _shift
+                    _lat = self._preprocess_latents_for_decode(_lat, _vae, kwargs)
                             
                     from weellm.memory import evict_module
                     for _comp in ["transformer", "text_encoder", "text_encoder_2", "text_encoder_3", "text_encoder_4", "connectors"]:
@@ -322,6 +444,10 @@ class WeeVideoPipeline(WeeBasePipeline):
                         if _c: evict_module(_c)
                     gc.collect()
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
+                    
+                    if user_output_type == "latent":
+                        out.frames = _lat
+                        return out
                     
                     with torch.no_grad():
                         _dec = _vae.decode(_lat, return_dict=False)[0]
@@ -331,4 +457,34 @@ class WeeVideoPipeline(WeeBasePipeline):
                 except Exception as e:
                     logger.warning(f"[VideoCache] Manual decode failed: {e}")
                     
+        # Wrap the diffusers output in our clean WeeVideoResult
+        _frames = getattr(out, "frames", None)
+        if _frames is None and hasattr(out, "videos"):
+            _frames = out.videos
+            
+        # LTX-2.5 base pipeline might return (video, audio) as a tuple if return_dict=False was somehow forced,
+        # but normally it returns an object with .frames and .audio
+        _audio = getattr(out, "audio", None)
+        
+        # Unbatch if necessary
+        if _frames is not None and isinstance(_frames, torch.Tensor) and _frames.dim() == 5:
+            _frames = _frames[0]
+        elif _frames is not None and isinstance(_frames, list) and len(_frames) > 0 and isinstance(_frames[0], list):
+            _frames = _frames[0]
+            
+        _fps = kwargs.get("fps", kwargs.get("frame_rate", 24))
+        
+        _audio_rate = 48000
+        if hasattr(_underlying, "vocoder") and hasattr(_underlying.vocoder, "config"):
+            _audio_rate = getattr(_underlying.vocoder.config, "output_sampling_rate", 48000)
+
+        # Return the wrapper if we successfully intercepted frames, otherwise return raw output
+        if _frames is not None:
+            return WeeVideoResult(
+                frames=_frames,
+                audio=_audio,
+                default_fps=_fps,
+                audio_rate=_audio_rate
+            )
+            
         return out
