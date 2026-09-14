@@ -36,7 +36,7 @@ def _remap_ckpt_key(ckpt_key: str) -> str:
         return ckpt_key[len("model.diffusion_model."):]
     return ckpt_key
 
-class LTX2DiTModelStreamer(BaseTransformerStreamer):
+class LTX2VideoTransformer3DModelStreamer(BaseTransformerStreamer):
     def _get_shard_order(self) -> List[Tuple[str, nn.Module]]:
         order = []
         if hasattr(self.model, "transformer_blocks"):
@@ -93,7 +93,7 @@ class LTX2DiTModelStreamer(BaseTransformerStreamer):
         prefetch: bool = True,
         prefetch_device: Optional[str] = None,
         cache_to_ram: bool = False,
-    ) -> "LTX2DiTModelStreamer":
+    ) -> "LTX2VideoTransformer3DModelStreamer":
         transformer_dir = Path(transformer_dir)
 
         logger.info("Step 1/3 -- Initializing LiveSeeker on LTX-2.5 transformer weights ...")
@@ -127,5 +127,5 @@ class LTX2DiTModelStreamer(BaseTransformerStreamer):
 
         block_count = len(streamer._get_shard_order())
         logger.info("Installed %d blocks for streaming.", block_count)
-        logger.info("LTX2DiTModelStreamer ready. Mode: Live Seek from original shards")
+        logger.info("LTX2VideoTransformer3DModelStreamer ready. Mode: Live Seek from original shards")
         return streamer
