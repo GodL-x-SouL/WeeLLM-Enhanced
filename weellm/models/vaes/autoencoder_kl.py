@@ -126,15 +126,31 @@ class AutoencoderKL(BaseVAEStreamer):
         )
 
     def _block_pre_hook(self, module: nn.Module, args):
+        import time
+        t0 = time.time()
         shard_prefix = module._vae_shard_prefix
         keys = self._get_block_keys(shard_prefix)
         sd   = self.seeker.get_tensors(keys, device=self.device, dtype=self.dtype)
+        t1 = time.time()
         for name, tensor in sd.items():
             self._place_tensor(name, tensor, self.device, self.dtype)
+        t2 = time.time()
         module._vae_loaded_keys = keys
+        
+        logger.info(
+            "    [VAE Streamer] %s: Disk/Wait=%.3fs | H2D+Apply=%.3fs",
+            shard_prefix, t1 - t0, t2 - t1,
+        )
+        module._weellm_t_compute_start = time.time()
         return args
 
     def _block_post_hook(self, module: nn.Module, args, output):
+        import time
+        t_end = time.time()
+        t_start = getattr(module, "_weellm_t_compute_start", t_end)
+        shard_prefix = getattr(module, "_vae_shard_prefix", "unknown")
+        logger.info("    [VAE Streamer] %s: GPU Compute=%.3fs (Offloading...)", shard_prefix, t_end - t_start)
+        
         self._evict_keys(getattr(module, "_vae_loaded_keys", []))
         module._vae_loaded_keys = []
         return output

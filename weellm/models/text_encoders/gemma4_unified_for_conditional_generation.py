@@ -51,6 +51,8 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
             layer.register_forward_hook(self._post_hook)
 
     def _pre_hook(self, module, args):
+        import time
+        t0 = time.time()
         shard_name = module._gemma_te_shard
         layer_keys = [k for k in self.seeker.weight_map if k.startswith(shard_name + ".")]
         
@@ -62,6 +64,7 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
             else:
                 sd = self.seeker.get_tensors(layer_keys, device=self.device, dtype=self.dtype)
                 
+        t1 = time.time()
         mapped_sd = {}
         for k, v in sd.items():
             if k.startswith("model.language_model."):
@@ -78,7 +81,14 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
                 if "layer_scalar" not in mapped_k:
                     logger.error(f"FAILED TO PLACE {mapped_k}: {repr(e)}")
                     
+        t2 = time.time()
         pos = int(shard_name.split(".")[-1])
+        logger.info(
+            "    [TE Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs",
+            shard_name, pos + 1, self.layer_count, t1 - t0, t2 - t1,
+        )
+        module._weellm_t_compute_start = time.time()
+        
         next_pos = pos + 1
         if self.prefetch and self._executor is not None and next_pos < self.layer_count:
             next_name = self._shard_order[next_pos]
@@ -90,6 +100,12 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
                 self._next_future_name = next_name
 
     def _post_hook(self, module, args, output):
+        import time
+        t_end = time.time()
+        t_start = getattr(module, "_weellm_t_compute_start", t_end)
+        shard_name = module._gemma_te_shard
+        logger.info("    [TE Streamer] %s: GPU Compute=%.3fs (Offloading...)", shard_name, t_end - t_start)
+        
         evict_module(module)
         return output
 
@@ -144,29 +160,47 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
                     layer.self_attn.q_norm = type(layer.self_attn.q_norm)(dim=512, eps=text_config.rms_norm_eps)
                     layer.self_attn.k_norm = type(layer.self_attn.k_norm)(dim=512, eps=text_config.rms_norm_eps)
                     
-            # Patch rotary embedding for full_attention to use dim=512
-            base = text_config.rope_parameters["full_attention"]["rope_theta"]
-            inv_freq = 1.0 / (base ** (torch.arange(0, 512, 2, dtype=torch.float32, device="meta") / 512.0))
-            model.rotary_emb.register_buffer("full_attention_inv_freq", inv_freq, persistent=False)
-            model.rotary_emb.register_buffer("full_attention_original_inv_freq", inv_freq.clone(), persistent=False)
-                    
         model.eval()
 
+        # Fix PyTorch meta buffers that lose their values during init_empty_weights()
+        logger.info("  Re-initializing rotary embeddings and scale buffers on GPU ...")
+        # 1. Re-initialize RoPE so all inv_freq buffers are calculated with real data
+        model.rotary_emb = type(model.rotary_emb)(text_config).to(device)
+        
+        # Patch rotary embedding for full_attention to use dim=512 ON DEVICE!
+        # Must correctly implement 'proportional' RoPE for dim 512 to avoid NaNs on long sequences
+        base = text_config.rope_parameters["full_attention"]["rope_theta"]
+        head_dim = 512
+        rope_proportion = text_config.rope_parameters["full_attention"]["partial_rotary_factor"]
+        rope_angles = int(rope_proportion * head_dim // 2)
+        
+        inv_freq_rotated = 1.0 / (
+            base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32, device=device) / head_dim)
+        )
+        nope_angles = head_dim // 2 - rope_angles
+        inv_freq = torch.cat(
+            (
+                inv_freq_rotated,
+                torch.zeros(nope_angles, dtype=torch.float32, device=device),
+            ),
+            dim=0,
+        )
+        model.rotary_emb.register_buffer("full_attention_inv_freq", inv_freq, persistent=False)
+        model.rotary_emb.register_buffer("full_attention_original_inv_freq", inv_freq.clone(), persistent=False)
+        
+        # 2. Fix embed_scale which also lost its value on the meta device
+        if hasattr(model.embed_tokens, "embed_scale"):
+            model.embed_tokens.embed_scale = torch.tensor(
+                text_config.hidden_size**0.5, dtype=torch.float32, device=device
+            )
+            
+        # 3. For any other remaining meta buffers (e.g. padding/mask buffers), just zero them out safely
         for buf_name, buf in model.named_buffers():
             if buf is not None and buf.device.type == "meta":
-                if "inv_freq" in buf_name:
-                    # Move to device while keeping the correct calculated values
-                    try:
-                        base = text_config.rope_parameters["full_attention"]["rope_theta"]
-                        inv_freq = 1.0 / (base ** (torch.arange(0, 512, 2, dtype=torch.float32, device=device) / 512.0))
-                        set_module_tensor_to_device(model, buf_name, device, value=inv_freq)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        set_module_tensor_to_device(model, buf_name, device, value=torch.zeros_like(buf, device=device))
-                    except Exception:
-                        pass
+                try:
+                    set_module_tensor_to_device(model, buf_name, device, value=torch.zeros_like(buf, device=device))
+                except Exception:
+                    pass
 
         logger.info("Step 2/3 -- Hooking streaming layers ...")
         streamer = cls(

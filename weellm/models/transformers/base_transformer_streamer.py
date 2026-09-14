@@ -141,7 +141,9 @@ class BaseTransformerStreamer(ABC):
         # Pipeline Seeding
         # ----------------------------------------------------------------
         if self.prefetch and self._disk_executor is not None:
-            # Seed disk reads for the initial blocks
+            # Seed disk reads for the initial blocks to CPU RAM.
+            # This hides disk I/O latency: by the time the first forward hook fires,
+            # the data is already in CPU RAM, so the H2D transfer is the only wait.
             for pos in range(self._prefetch_depth + 1):
                 if pos < len(self._shard_order):
                     b_name, _ = self._shard_order[pos]
@@ -149,14 +151,45 @@ class BaseTransformerStreamer(ABC):
                     self._disk_futures[b_name] = self._disk_executor.submit(
                         self.seeker.get_tensors, b_keys, "cpu", self.dtype
                     )
-            
-            # Seed H2D for the very first block so it's ready when the loop starts
-            if len(self._shard_order) > 0:
+
+            # Seed H2D for block[0] so it is already in VRAM when the first forward
+            # pass starts — this eliminates H2D wait time entirely for the first block.
+            #
+            # VRAM budget guard: skip eager seeding if the block would not fit in the
+            # remaining free VRAM budget (e.g. 4 GB cards with tight static footprint).
+            # The pre-hook will fall back to synchronous loading in that case.
+            if len(self._shard_order) > 0 and torch.cuda.is_available():
                 b0_name, _ = self._shard_order[0]
                 b0_keys = self._get_layer_keys(b0_name)
-                self._h2d_futures[b0_name] = self._h2d_executor.submit(
-                    self._do_h2d, b0_name, b0_keys
-                )
+                try:
+                    b0_bytes = self.seeker.get_block_bytes(b0_keys)
+                    global_vram_budget_gb = getattr(self.__class__, "_global_vram_budget_gb", None)
+                    if global_vram_budget_gb is not None:
+                        total_vram = global_vram_budget_gb * 1024 ** 3
+                        current_alloc = torch.cuda.memory_allocated(self.device)
+                        free_vram = max(0, total_vram - current_alloc)
+                    else:
+                        free_vram, _ = torch.cuda.mem_get_info(self.device)
+
+                    if b0_bytes + _VRAM_SAFETY_BYTES < free_vram:
+                        self._h2d_futures[b0_name] = self._h2d_executor.submit(
+                            self._do_h2d, b0_name, b0_keys
+                        )
+                        logger.debug(
+                            "[Streamer] Eager H2D seed for block[0] '%s' (%.0f MB) — "
+                            "%.0f MB free VRAM available.",
+                            b0_name, b0_bytes / 1e6, free_vram / 1e6,
+                        )
+                    else:
+                        logger.debug(
+                            "[Streamer] Skipping eager H2D seed for block[0] '%s' (%.0f MB) — "
+                            "only %.0f MB free VRAM (need %.0f MB + safety margin). "
+                            "Pre-hook will load lazily.",
+                            b0_name, b0_bytes / 1e6, free_vram / 1e6,
+                            (b0_bytes + _VRAM_SAFETY_BYTES) / 1e6,
+                        )
+                except Exception:
+                    pass  # If budget check fails for any reason, fall back to lazy loading
 
     # ------------------------------------------------------------------
     # Adaptive prefetch depth computation
