@@ -154,10 +154,19 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
 
         for buf_name, buf in model.named_buffers():
             if buf is not None and buf.device.type == "meta":
-                try:
-                    set_module_tensor_to_device(model, buf_name, device, value=torch.zeros_like(buf, device=device))
-                except Exception:
-                    pass
+                if "inv_freq" in buf_name:
+                    # Move to device while keeping the correct calculated values
+                    try:
+                        base = text_config.rope_parameters["full_attention"]["rope_theta"]
+                        inv_freq = 1.0 / (base ** (torch.arange(0, 512, 2, dtype=torch.float32, device=device) / 512.0))
+                        set_module_tensor_to_device(model, buf_name, device, value=inv_freq)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        set_module_tensor_to_device(model, buf_name, device, value=torch.zeros_like(buf, device=device))
+                    except Exception:
+                        pass
 
         logger.info("Step 2/3 -- Hooking streaming layers ...")
         streamer = cls(

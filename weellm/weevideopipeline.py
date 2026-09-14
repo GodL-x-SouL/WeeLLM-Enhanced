@@ -21,6 +21,20 @@ class WeeVideoResult:
     mimicking the PIL.Image experience for video generation.
     """
     def __init__(self, frames, audio=None, default_fps=24, audio_rate=48000):
+        # Un-nest if it's a list of lists (e.g. batch size 1 list of frames)
+        while isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], list):
+            frames = frames[0]
+            
+        # Unbatch if it's a 5D tensor [B, C, F, H, W] -> [C, F, H, W]
+        if isinstance(frames, torch.Tensor):
+            if frames.dim() == 5:
+                frames = frames[0]
+            # Convert [C, F, H, W] to list of numpy arrays [F, H, W, C] for export
+            if frames.dim() == 4:
+                import numpy as np
+                frames = frames.permute(1, 2, 3, 0).cpu().float().numpy()
+                frames = [np.clip(f * 255.0, 0, 255).astype(np.uint8) if f.max() <= 1.0 else f for f in frames]
+                
         self.frames = frames
         self.audio = audio
         self.default_fps = default_fps
@@ -38,19 +52,34 @@ class WeeVideoResult:
         if has_encode and self.audio is not None:
             # Format audio correctly (typically requires float CPU tensor)
             _audio = self.audio
+            _valid_audio = False
+            
             if isinstance(_audio, torch.Tensor):
                 _audio = _audio.float().cpu()
-                if _audio.dim() > 2 and _audio.shape[0] == 1:
-                    _audio = _audio[0] # [channels, length]
+                # Unbatch if shape is [1, channels, samples]
+                if _audio.dim() == 3 and _audio.shape[0] == 1:
+                    _audio = _audio[0]
+                    
+                # A decoded audio waveform should be [channels, samples] where channels is 1 or 2
+                if _audio.dim() == 2 and _audio.shape[0] in [1, 2]:
+                    _valid_audio = True
+                elif _audio.dim() == 1:
+                    _valid_audio = True
+                    _audio = _audio.unsqueeze(0)
             
-            encode_video(
-                self.frames,
-                fps=final_fps,
-                output_path=filepath,
-                audio=_audio,
-                audio_sample_rate=self.audio_rate,
-                **kwargs
-            )
+            if _valid_audio:
+                encode_video(
+                    self.frames,
+                    fps=final_fps,
+                    output_path=filepath,
+                    audio=_audio,
+                    audio_sample_rate=self.audio_rate,
+                    **kwargs
+                )
+            else:
+                logger.warning(f"Audio tensor has invalid shape for encoding: {getattr(self.audio, 'shape', 'unknown')}. Exporting video without audio.")
+                from diffusers.utils import export_to_video
+                export_to_video(self.frames, output_video_path=filepath, fps=final_fps)
         else:
             from diffusers.utils import export_to_video
             export_to_video(self.frames, output_video_path=filepath, fps=final_fps)
@@ -343,11 +372,31 @@ class WeeVideoPipeline(WeeBasePipeline):
                         _decoded = _vae.decode(_lat, return_dict=False)[0]
                         _video = _vproc.postprocess_video(_decoded, output_type="pil") if _vproc else _decoded
                         
-                    class _CachedOutput:
-                        frames = _video
-                        audio = None
-                        sampling_rate = 24000
-                    return _CachedOutput()
+                    _audio = None
+                    if "audio_latents" in _cached_final and getattr(_underlying, "audio_vae", None) and getattr(_underlying, "vocoder", None):
+                        try:
+                            _audio_vae = _underlying.audio_vae
+                            _vocoder = _underlying.vocoder
+                            with torch.no_grad():
+                                _audio_lat = _cached_final["audio_latents"].to(_audio_vae.dtype).to(_audio_vae.device)
+                                _mel = _audio_vae.decode(_audio_lat, return_dict=False)[0]
+                                _mel = _mel.to(_vocoder.dtype).to(_vocoder.device)
+                                _audio_out = _vocoder(_mel)
+                                if isinstance(_audio_out, tuple): _audio_out = _audio_out[0]
+                                _audio = _audio_out.cpu().float()
+                        except Exception as e:
+                            logger.warning(f"[VideoCache] Audio decode failed: {e}")
+
+                    _audio_rate = 48000
+                    if hasattr(_underlying, "vocoder") and hasattr(_underlying.vocoder, "config"):
+                        _audio_rate = getattr(_underlying.vocoder.config, "output_sampling_rate", 48000)
+
+                    return WeeVideoResult(
+                        frames=_video,
+                        audio=_audio,
+                        audio_rate=_audio_rate,
+                        default_fps=kwargs.get("fps", kwargs.get("frame_rate", 24))
+                    )
                 except Exception as e:
                     logger.warning(f"[VideoCache] Decode-only failed: {e}")
                     kwargs["callback_on_step_end"] = _video_cache.get_step_callback()
@@ -418,12 +467,19 @@ class WeeVideoPipeline(WeeBasePipeline):
         
         try:
             _raw_latents = None
+            _raw_audio = None
             if hasattr(out, "frames") and isinstance(out.frames, torch.Tensor):
                 _raw_latents = out.frames
             elif hasattr(out, "videos") and isinstance(out.videos, torch.Tensor):
                 _raw_latents = out.videos
+            if hasattr(out, "audio") and isinstance(out.audio, torch.Tensor):
+                _raw_audio = out.audio
+                
             if _raw_latents is not None:
-                _video_cache.save_final({"latents": _raw_latents.cpu()})
+                _save_dict = {"latents": _raw_latents.cpu()}
+                if _raw_audio is not None:
+                    _save_dict["audio_latents"] = _raw_audio.cpu()
+                _video_cache.save_final(_save_dict)
         except Exception as e:
             logger.debug(f"[VideoCache] Could not save final cache: {e}")
             
@@ -462,9 +518,27 @@ class WeeVideoPipeline(WeeBasePipeline):
         if _frames is None and hasattr(out, "videos"):
             _frames = out.videos
             
-        # LTX-2.5 base pipeline might return (video, audio) as a tuple if return_dict=False was somehow forced,
-        # but normally it returns an object with .frames and .audio
         _audio = getattr(out, "audio", None)
+        
+        # If we have audio latents and a vocoder, manually decode
+        if _audio is not None and isinstance(_audio, torch.Tensor) and _audio.dim() > 2 and user_output_type != "latent":
+            _audio_vae = getattr(_underlying, "audio_vae", None)
+            _vocoder = getattr(_underlying, "vocoder", None)
+            
+            if _audio_vae and _vocoder:
+                try:
+                    logger.info("[WeeLLM] Manually decoding audio latents using audio_vae and vocoder...")
+                    with torch.no_grad():
+                        _audio = _audio.to(_audio_vae.dtype).to(_audio_vae.device)
+                        _mel = _audio_vae.decode(_audio, return_dict=False)[0]
+                        _mel = _mel.to(_vocoder.dtype).to(_vocoder.device)
+                        _audio = _vocoder(_mel)
+                        if isinstance(_audio, tuple): _audio = _audio[0]
+                        _audio = _audio.cpu().float()
+                except Exception as e:
+                    logger.warning(f"Audio manual decoding failed: {e}")
+            else:
+                logger.warning("Pipeline output audio latents, but audio_vae/vocoder not found for manual decode.")
         
         # Unbatch if necessary
         if _frames is not None and isinstance(_frames, torch.Tensor) and _frames.dim() == 5:

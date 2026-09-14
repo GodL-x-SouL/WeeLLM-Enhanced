@@ -69,6 +69,18 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 except Exception as e:
                     logger.warning("Failed to load connectors in WeeLTX2Pipeline: %s", e)
                     
+            if "audio_vae" in index and "audio_vae" not in kwargs:
+                try:
+                    from diffusers.models.autoencoders.autoencoder_kl_ltx2_audio import AutoencoderKLLTX2Audio
+                    device = kwargs.get("device", "cuda")
+                    dtype = kwargs.get("torch_dtype", torch.bfloat16)
+                    audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
+                        model_dir_path / "audio_vae", torch_dtype=dtype
+                    ).to(device)
+                    kwargs["audio_vae"] = audio_vae
+                except Exception as e:
+                    logger.warning("Failed to load audio_vae: %s", e)
+                    
         pipe = super().from_pretrained(model_dir, **kwargs)
         
         # Override the base pipeline's default VAE chunking because LTX-2.5 is sensitive to it

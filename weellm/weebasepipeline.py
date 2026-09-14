@@ -312,6 +312,8 @@ class WeeBasePipeline:
         vae_dtype = torch.float32 if effective_dtype in (torch.float16, torch.bfloat16) else effective_dtype
         for vae_key in ["vae", "video_vae", "audio_vae"]:
             if vae_key in index:
+                if vae_key in diffusers_kwargs:
+                    continue
                 if not (model_dir_path / vae_key).exists():
                     logger.warning("Directory for %s does not exist, skipping.", vae_key)
                     continue

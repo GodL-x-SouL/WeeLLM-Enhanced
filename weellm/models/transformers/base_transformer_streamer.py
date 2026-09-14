@@ -410,7 +410,7 @@ class BaseTransformerStreamer(ABC):
         t2 = time.time()
 
         logger.debug(
-            "    [Profile] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs",
+            "    [Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs",
             shard_name, pos + 1, len(self._shard_order), t1 - t0, t2 - t1,
         )
         setattr(module, "_weellm_t_compute_start", time.time())
@@ -471,7 +471,7 @@ class BaseTransformerStreamer(ABC):
         t_end  = time.time()
         t_start = getattr(module, "_weellm_t_compute_start", t_end)
         shard_name = getattr(module, _SHARD_NAME_ATTR)
-        logger.debug("    [Profile] %s: GPU Compute=%.3fs", shard_name, t_end - t_start)
+        logger.debug("    [Streamer] %s: GPU Compute=%.3fs (Offloading...)", shard_name, t_end - t_start)
 
         should_evict = True
 
