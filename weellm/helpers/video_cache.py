@@ -95,7 +95,7 @@ class VideoStepCache:
     prompt:
         The text prompt.  Used as the sole key for the embeds cache so the
         same embeds are reused across different resolutions / step counts.
-    height, width, num_frames, steps, seed:
+    height, width, num_frames, steps, seed, lora_weights:
         Together with *prompt* these form the run key; any change busts the
         denoising cache (but not the embeds cache).
     save_every:
@@ -113,6 +113,7 @@ class VideoStepCache:
         num_frames: int,
         steps: int,
         seed: int,
+        lora_weights: Optional[str] = None,
         save_every: int = 1,
         cache_root: Optional[str] = None,
     ) -> None:
@@ -122,7 +123,7 @@ class VideoStepCache:
         prompt_hash = _sha1(prompt)
         run_hash    = _sha1(
             prompt,
-            str(height), str(width), str(num_frames), str(steps), str(seed),
+            str(height), str(width), str(num_frames), str(steps), str(seed), str(lora_weights),
         )
 
         self.embeds_dir = root / f"embeds_{prompt_hash}"
@@ -201,7 +202,7 @@ class VideoStepCache:
 
     # ── Per-step callback ─────────────────────────────────────────────────────
 
-    def get_step_callback(self):
+    def get_step_callback(self, resume_step: Optional[int] = None, resume_latents: Optional[Dict[str, Any]] = None):
         """
         Return a ``callback_on_step_end`` compatible with all standard diffusers
         pipelines::
@@ -216,11 +217,23 @@ class VideoStepCache:
         run_dir    = self.run_dir
 
         def _step_callback(pipe, step_index: int, timestep, callback_kwargs: dict):
+            if resume_step is not None and resume_latents is not None:
+                if step_index == resume_step:
+                    logger.info("[VideoCache] Injecting preserved latents at step %d", step_index)
+                    if "latents" in resume_latents:
+                        callback_kwargs["latents"] = resume_latents["latents"].to(pipe.device)
+                    if "audio_latents" in resume_latents and "audio_latents" in callback_kwargs:
+                        callback_kwargs["audio_latents"] = resume_latents["audio_latents"].to(pipe.device)
+
             if step_index % save_every == 0:
-                latents = callback_kwargs.get("latents")
-                if latents is not None:
+                save_dict = {}
+                for k in ["latents", "audio_latents"]:
+                    v = callback_kwargs.get(k)
+                    if v is not None:
+                        save_dict[k] = v.cpu()
+                if save_dict:
                     step_path = run_dir / f"step_{step_index:04d}.pt"
-                    torch.save(latents.cpu(), str(step_path))
+                    torch.save(save_dict, str(step_path))
                     logger.debug(
                         "[VideoCache] Step %4d checkpoint → %s",
                         step_index, step_path.name,
@@ -317,17 +330,35 @@ class VideoStepCache:
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
+    def latest_step_file(self) -> Optional[Path]:
+        """Return the most recently checkpointed step path, or ``None``."""
+        step_files = sorted(self.run_dir.glob("step_*.pt"))
+        return step_files[-1] if step_files else None
+
+    def step_from_file(self, path: Path) -> int:
+        """Parse step_NNNN.pt and return the step index NNNN."""
+        import re
+        match = re.search(r"step_(\d+)\.pt", path.name)
+        return int(match.group(1)) if match else -1
+
+    def load_step(self, path: Path) -> Dict[str, Any]:
+        """Load a step checkpoint. Wraps older tensor-only files in a dict."""
+        data = torch.load(str(path), map_location="cpu", weights_only=False)
+        if isinstance(data, torch.Tensor):
+            return {"latents": data}
+        return data
+
     def latest_step_latents(self) -> Optional[torch.Tensor]:
         """
         Return the most recently checkpointed step latents, or ``None``.
         Useful for inspecting what the denoiser has produced so far.
         """
-        step_files = sorted(self.run_dir.glob("step_*.pt"))
-        if not step_files:
+        latest = self.latest_step_file()
+        if not latest:
             return None
-        latest = step_files[-1]
         logger.info("[VideoCache] Latest step checkpoint: %s", latest.name)
-        return torch.load(str(latest), map_location="cpu", weights_only=False)
+        data = self.load_step(latest)
+        return data.get("latents")
 
     def clear_run(self) -> None:
         """

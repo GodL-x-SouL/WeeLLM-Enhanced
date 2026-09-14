@@ -1,115 +1,248 @@
 """
-Dynamic RAM-based LoRA Loader for WeeLLM MiniMax-H3 streaming.
-Loads the Larry LoRA permanently into CPU RAM, and provides a method
-to rapidly inject it into VRAM block modules on the fly.
+LoRA loaders for WeeLLM.
+
+GenericLazyLoRALoader
+    For any PEFT-style safetensors LoRA file – including massive ones (e.g. 9 GB).
+    Parses only the safetensors header into RAM (~kilobytes); tensors are streamed
+    from SSD to GPU one pair at a time during apply_to_module, then freed
+    immediately.  Peak extra RAM is max(A_tensor_size, B_tensor_size) × 2 – a few
+    MB at most, regardless of file size.
+
+    Supported key prefixes in the file (auto-stripped):
+        - transformer.transformer_blocks.N.*
+        - transformer_blocks.N.*          (no transformer. prefix)
+        - diffusion_model.transformer_blocks.N.*
+        - base_model.model.transformer_blocks.N.*
 """
 
 import os
-import torch
+import struct
+import json
 import logging
+
+import numpy as np
+import torch
 
 logger = logging.getLogger("weellm")
 
-class MiniMaxH3LoRALoader:
-    def __init__(self, inner_dim: int = None, strength: float = 1.0):
-        self.inner_dim = inner_dim  # will be auto-detected from file if None
-        self.strength = strength
-        self.entries = []
-        self._load()
 
-    def _larry_targets(self, name: str, b: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
-        """Map one reference-tree base name and its `lora_B` onto diffusers parameter key + row-transformed B."""
-        if name.startswith("token_refiner.blocks."):
-            target = name.replace("token_refiner.blocks.", "token_refiner.refiner_blocks.", 1)
-        elif name.startswith("blocks."):
-            target = name.replace("blocks.", "transformer_blocks.", 1)
-        else:
-            target = name
-        target = target.replace("final_layer.adaln_proj.linear", "norm_out.linear")
+# ---------------------------------------------------------------------------
+# GenericLazyLoRALoader
+# ---------------------------------------------------------------------------
 
-        if target.endswith(".attn.qkv_proj"):
-            prefix = target.removesuffix("qkv_proj")
-            return [
-                (f"{prefix}to_{kind}.weight", part.contiguous())
-                for kind, part in zip(("q", "k", "v"), b.split(self.inner_dim, dim=0))
-            ]
-        if target.endswith(".mlp.fc1"):
-            gate, value = b.chunk(2, dim=0)
-            return [(target.replace(".mlp.fc1", ".ff.net.0.proj") + ".weight", torch.cat([value, gate]).contiguous())]
-        if target.endswith(".mlp.fc2"):
-            return [(target.replace(".mlp.fc2", ".ff.net.2") + ".weight", b)]
-        if target.endswith(".attn.out_proj"):
-            return [(target.replace(".attn.out_proj", ".attn.to_out.0") + ".weight", b)]
-        # `adaln_proj.linear` (block-level and the final `norm_out.linear`): identical row layout on both sides.
-        return [(target + ".weight", b)]
+class GenericLazyLoRALoader:
+    """
+    Memory-efficient PEFT-style LoRA loader for very large safetensors files.
 
-    def _load(self):
-        from huggingface_hub import hf_hub_download
-        from safetensors.torch import load_file
-        
-        repo_id = os.environ.get("H3_LORA_REPO", "larryvrh/MiniMax-H3-Turbo-Lora")
-        filename = os.environ.get("H3_LORA", "minimax_h3_turbo_4step_ema_ckpt850.safetensors")
-        
-        logger.info(f"[LoRA] Downloading / Loading {repo_id}/{filename} into CPU RAM...")
-        file_path = hf_hub_download(repo_id, filename)
-        
-        # Load into RAM
-        lora = load_file(file_path)
-        bases = sorted({key.rsplit(".lora_", 1)[0] for key in lora})
-        
-        # Auto-detect inner_dim from the first qkv_proj lora_B in the file.
-        # lora_B for qkv_proj has shape [3 * inner_dim, rank], so inner_dim = B.shape[0] // 3
-        if self.inner_dim is None:
-            for name in bases:
-                if name.endswith(".attn.qkv_proj"):
-                    b = lora[f"{name}.lora_B.weight"]
-                    self.inner_dim = b.shape[0] // 3
-                    logger.info(f"[LoRA] Auto-detected inner_dim = {self.inner_dim} (from {name})")
-                    break
-            if self.inner_dim is None:
-                raise RuntimeError("[LoRA] Could not auto-detect inner_dim: no .attn.qkv_proj key found in LoRA file.")
-        
-        for name in bases:
-            a = lora[f"{name}.lora_A.weight"]
-            b = lora[f"{name}.lora_B.weight"]
-            self.entries.extend((key, a, b_part) for key, b_part in self._larry_targets(name, b))
-            
-        logger.info(f"[LoRA] Loaded {len(self.entries)} weight deltas into CPU RAM.")
+    How it works
+    ------------
+    1. __init__: Open the file once, read the JSON header (kilobytes) and close.
+       Build a ``lora_map`` dict: base_path → (A_key, B_key).
+    2. apply_to_module: Open the file, iterate over matching pairs, seek to each
+       tensor, read its bytes, push to GPU, compute delta, apply, free – all
+       within a single file handle that lives only for the duration of the call.
+
+    No mmap, no full-file load.  RAM overhead ≈ 2 × size_of_largest_tensor_pair.
+    For LTX-2.5 at bf16 with rank 128 and dim 5120 that is ≈ 5 MB per call.
+
+    Key normalisation (auto-detected, no config needed)
+    ---------------------------------------------------
+    The loader strips any of the following leading prefixes from LoRA keys:
+        diffusion_model.
+        base_model.model.
+        transformer.
+    so that ``base_path`` always starts with the unqualified layer name, e.g.
+    ``transformer_blocks.47.attn1.to_q``.
+
+    When apply_to_module is called with shard_name ``transformer_blocks.47`` (or
+    ``transformer.transformer_blocks.47``), the matching base_paths are found and
+    ``local_key = base_path[len(prefix):] + ".weight"`` is looked up in the
+    module's named_parameters() dict.
+
+    Skipped keys
+    ------------
+    If a LoRA key cannot be matched to a model parameter, a WARNING is emitted
+    *once per unique key* (subsequent calls reuse ``_skipped_keys`` set).
+    """
+
+    _DTYPE_MAP: dict[str, tuple] = {
+        "F64":  (np.float64,  None),
+        "F32":  (np.float32,  None),
+        "F16":  (np.float16,  None),
+        "BF16": (np.uint16,   torch.bfloat16),
+        "I64":  (np.int64,    None),
+        "I32":  (np.int32,    None),
+        "I16":  (np.int16,    None),
+        "I8":   (np.int8,     None),
+        "U8":   (np.uint8,    None),
+    }
+
+    def __init__(self, lora_path: str, scale: float = 1.0):
+        self.lora_path    = lora_path
+        self.scale        = scale
+        self._skipped_keys: set[str] = set()
+
+        # ----------------------------------------------------------------
+        # Parse safetensors header without loading tensor data
+        # ----------------------------------------------------------------
+        with open(lora_path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            header_raw = f.read(n)
+            self._header: dict = json.loads(header_raw.decode("utf-8"))
+
+        self.data_base: int = 8 + n
+        self._header.pop("__metadata__", None)
+        self.keys: set[str] = set(self._header.keys())
+
+        # ----------------------------------------------------------------
+        # Build lora_pairs:  (A_file_key, B_file_key, targets)
+        # ----------------------------------------------------------------
+        from weellm.models.loras.lora_keymaps import build_lora_pairs
+        self.lora_pairs, _ = build_lora_pairs(self.keys)
+
+        logger.info(
+            "[LoRA] Indexed %d LoRA weight pairs from: %s",
+            len(self.lora_pairs),
+            os.path.basename(lora_path),
+        )
+
+    # ------------------------------------------------------------------
+    # Internal: read one tensor from disk (no mmap)
+    # ------------------------------------------------------------------
+
+    def _read_tensor(
+        self,
+        f,          # open file handle (binary read)
+        key: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        meta              = self._header[key]
+        dtype_str: str    = meta["dtype"]
+        shape: list[int]  = meta["shape"]
+        start, end        = meta["data_offsets"]
+        nbytes: int       = end - start
+
+        np_dtype, torch_view_dtype = self._DTYPE_MAP.get(dtype_str, (None, None))
+        if np_dtype is None:
+            raise ValueError(f"[LoRA] Unsupported safetensors dtype '{dtype_str}' for key '{key}'")
+
+        buf = bytearray(nbytes)
+        f.seek(self.data_base + start)
+        n_read = f.readinto(memoryview(buf))
+        if n_read != nbytes:
+            raise IOError(
+                f"[LoRA] Short read for '{key}': expected {nbytes} bytes, got {n_read} bytes"
+            )
+
+        arr = np.frombuffer(buf, dtype=np_dtype)
+        if shape:
+            arr = arr.reshape(shape)
+
+        t = torch.from_numpy(arr.copy())
+        if torch_view_dtype is not None:
+            t = t.view(torch_view_dtype)
+
+        return t.to(device=device, dtype=torch.float32)
+
+    # ------------------------------------------------------------------
+    # Public: apply matching LoRA tensors to one model shard
+    # ------------------------------------------------------------------
 
     def apply_to_module(self, module: torch.nn.Module, shard_name: str):
         """
-        Applies the LoRA delta to a specific block (shard) directly in VRAM.
-        `shard_name` usually looks like "transformer.transformer_blocks.0"
+        Stream-apply LoRA deltas for *shard_name* into *module* (already in VRAM).
+
+        Parameters
+        ----------
+        module     : The nn.Module for this shard (one transformer block, etc.).
+        shard_name : Qualified name of the shard, e.g.:
+                     "transformer_blocks.47"
+                     "transformer.transformer_blocks.47"
         """
-        # Find which LoRA entries belong to this shard
-        # Note: self.entries keys don't have "transformer." prefix, they start with "transformer_blocks.N."
-        
-        # Determine the prefix to match in the LoRA dict
-        # Diffusers keys in entries: "transformer_blocks.0.attn.to_q.weight"
-        # shard_name might be "transformer_blocks.0" or "transformer.transformer_blocks.0"
-        
+        # Normalise shard prefix – strip leading "transformer." so it matches
+        # the normalised lora_map keys.
         prefix = shard_name
         if prefix.startswith("transformer."):
             prefix = prefix[len("transformer."):]
-        if prefix:
-            prefix = prefix + "."
-        
-        params = dict(module.named_parameters())
-        
-        applied_count = 0
-        for key, a, b in self.entries:
-            if key.startswith(prefix):
-                # local_key is what `module.named_parameters()` has, e.g. "attn.to_q.weight"
-                local_key = key[len(prefix):]
-                
-                param = params.get(local_key)
-                if param is not None:
-                    # Both B and A are in RAM. Move them to the same device as the param (VRAM)
-                    # and do the matrix multiplication on the GPU
+        if prefix and not prefix.endswith("."):
+            prefix += "."
+
+        params         = dict(module.named_parameters())
+        applied_count  = 0
+        skipped_count  = 0
+
+        with open(self.lora_path, "rb") as f:
+            for a_key, b_key, targets in self.lora_pairs:
+                # Does this LoRA entry belong to the requested shard?
+                matching_targets = []
+                for t_key, slice_info in targets:
+                    if t_key.startswith(prefix):
+                        matching_targets.append((t_key[len(prefix):], slice_info))
+
+                if not matching_targets:
+                    continue
+
+                valid_targets = []
+                for local_key, slice_info in matching_targets:
+                    param = params.get(local_key)
+                    if param is None:
+                        if local_key not in self._skipped_keys:
+                            logger.warning(
+                                "[LoRA] Key not found in model — SKIPPED: '%s'  (from A='%s')",
+                                local_key,
+                                a_key,
+                            )
+                            self._skipped_keys.add(local_key)
+                        skipped_count += 1
+                    else:
+                        valid_targets.append((param, local_key, slice_info))
+
+                if not valid_targets:
+                    continue
+
+                try:
+                    a_t = self._read_tensor(f, a_key, valid_targets[0][0].device)   # float32 on GPU
+                    b_t = self._read_tensor(f, b_key, valid_targets[0][0].device)   # float32 on GPU
+
                     with torch.no_grad():
-                        delta = self.strength * (b.float() @ a.float())
-                        param.data.add_(delta.to(device=param.device, dtype=param.dtype))
-                    applied_count += 1
-                    
-        if applied_count > 0:
-            logger.debug(f"[LoRA] Applied {applied_count} LoRA tensors to {shard_name}")
+                        delta = self.scale * (b_t @ a_t)
+                        
+                        for param, local_key, slice_info in valid_targets:
+                            # Apply slicing if necessary
+                            if slice_info is not None:
+                                if slice_info[0] == "chunk_reorder":
+                                    n_chunks = slice_info[1]
+                                    order = slice_info[2]
+                                    chunks = delta.chunk(n_chunks, dim=0)
+                                    sub_delta = torch.cat([chunks[i] for i in order], dim=0)
+                                else:
+                                    split_idx, total_splits = slice_info
+                                    chunks = delta.chunk(total_splits, dim=0)
+                                    sub_delta = chunks[split_idx]
+                            else:
+                                sub_delta = delta
+                                
+                            param.data.add_(sub_delta.to(dtype=param.dtype))
+                            applied_count += 1
+
+                    # Release GPU memory immediately – do not accumulate across pairs
+                    del a_t, b_t, delta
+                    if 'sub_delta' in locals():
+                        del sub_delta
+
+                except Exception as exc:
+                    logger.error(
+                        "[LoRA] Failed to apply delta for '%s': %s",
+                        valid_targets[0][1],
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
+
+        if applied_count > 0 or skipped_count > 0:
+            logger.info(
+                "[LoRA] Lazily applied %d LoRA tensors to '%s'  (%d skipped)",
+                applied_count,
+                shard_name,
+                skipped_count,
+            )
