@@ -11,7 +11,7 @@ import inspect
 import logging
 import importlib
 
-from weellm.weebasepipeline import WeeBasePipeline
+from weellm.pipelines.weebasepipeline import WeeBasePipeline
 
 logger = logging.getLogger("weellm")
 
@@ -154,7 +154,7 @@ class WeeVideoPipeline(WeeBasePipeline):
         return latents
 
     def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None):
-        from weellm.helpers.video_cache import VideoStepCache
+        from weellm.pipelines.video.video_cache import VideoStepCache
         if cache_root is None:
             cache_root = os.path.join(
                 os.path.dirname(os.path.abspath(self.model_dir)), ".weellm_cache"

@@ -7,7 +7,7 @@ import torch
 import logging
 from PIL import Image
 
-from weellm.weebasepipeline import WeeBasePipeline
+from weellm.pipelines.weebasepipeline import WeeBasePipeline
 
 logger = logging.getLogger("weellm")
 

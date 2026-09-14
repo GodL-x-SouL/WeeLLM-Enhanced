@@ -8,7 +8,7 @@ Handles 8k+1 frame math and dummy audio injection.
 import math
 import logging
 import torch
-from weellm.weevideopipeline import WeeVideoPipeline
+from weellm.pipelines.video.weevideopipeline import WeeVideoPipeline
 
 logger = logging.getLogger("weellm")
 
@@ -19,7 +19,7 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         from pathlib import Path
         import json
         import torch
-        from weellm.weebasepipeline import WeeBasePipeline
+        from weellm.pipelines.weebasepipeline import WeeBasePipeline
         
         model_dir_path = Path(model_dir)
         

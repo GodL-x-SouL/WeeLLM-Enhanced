@@ -7,7 +7,7 @@ diffusers MiniMax components to WeeLLM layer-by-layer streamers.
 """
 
 import logging
-from weellm.weevideopipeline import WeeVideoPipeline
+from weellm.pipelines.video.weevideopipeline import WeeVideoPipeline
 
 logger = logging.getLogger("weellm")
 

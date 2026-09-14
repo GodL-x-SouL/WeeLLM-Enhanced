@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 import logging
 
-from weellm.weebasepipeline import WeeBasePipeline
+from weellm.pipelines.weebasepipeline import WeeBasePipeline
 
 logger = logging.getLogger("weellm")
 

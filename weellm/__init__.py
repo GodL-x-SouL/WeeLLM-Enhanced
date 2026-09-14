@@ -74,10 +74,10 @@ __all__ = [
 # Applications that want output should configure their own handlers.
 logging.getLogger("weellm").addHandler(logging.NullHandler())
 
-from .weebasepipeline import WeeBasePipeline  # noqa: E402
-from .weetexttoimagepipeline import WeeTextToImagePipeline, WeePipeline  # noqa: E402
-from .weeimagetoimagepipeline import WeeImageToImagePipeline, WeeImagePipeline  # noqa: E402
-from .weevideopipeline import WeeVideoPipeline  # noqa: E402
+from .pipelines.weebasepipeline import WeeBasePipeline  # noqa: E402
+from .pipelines.image.weetexttoimagepipeline import WeeTextToImagePipeline, WeePipeline  # noqa: E402
+from .pipelines.image.weeimagetoimagepipeline import WeeImageToImagePipeline, WeeImagePipeline  # noqa: E402
+from .pipelines.video.weevideopipeline import WeeVideoPipeline  # noqa: E402
 
 # VAE
 from .models.vaes.autoencoder_kl import AutoencoderKL  # noqa: E402
