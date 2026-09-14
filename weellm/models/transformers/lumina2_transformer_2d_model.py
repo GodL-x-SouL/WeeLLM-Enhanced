@@ -14,8 +14,8 @@ import torch
 import torch.nn as nn
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 
@@ -58,7 +58,7 @@ class Lumina2Transformer2DModelStreamer(BaseTransformerStreamer):
         from diffusers.models.transformers.transformer_lumina2 import Lumina2Transformer2DModel
         from accelerate import init_empty_weights
         from accelerate.utils.modeling import set_module_tensor_to_device
-        from weellm.utils import default_dtype
+        from weellm.io.utils import default_dtype
 
         model_dir = Path(model_dir)
 

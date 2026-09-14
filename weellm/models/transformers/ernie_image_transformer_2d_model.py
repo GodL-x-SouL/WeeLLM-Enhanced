@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 

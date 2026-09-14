@@ -24,8 +24,8 @@ import torch
 import torch.nn as nn
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 
@@ -358,7 +358,7 @@ class Krea2Transformer2DModelStreamer(BaseTransformerStreamer):
                 block.ff_trigger = nn.Identity()
                 
                 def evict_attn():
-                    from weellm.memory import evict_module
+                    from weellm.io.memory import evict_module
                     from accelerate.utils import set_module_tensor_to_device
                     evict_module(block.norm1)
                     evict_module(block.attn)
@@ -366,7 +366,7 @@ class Krea2Transformer2DModelStreamer(BaseTransformerStreamer):
                 block.evict_attn = evict_attn
                 
                 def evict_ff():
-                    from weellm.memory import evict_module
+                    from weellm.io.memory import evict_module
                     evict_module(block.norm2)
                     evict_module(block.ff)
                 block.evict_ff = evict_ff

@@ -23,11 +23,11 @@ from typing import List, Union
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
+from weellm.io.utils import default_dtype
 from accelerate.utils.modeling import set_module_tensor_to_device
 
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
 from .base_vae_streamer import BaseVAEStreamer
 
 logger = logging.getLogger("weellm")

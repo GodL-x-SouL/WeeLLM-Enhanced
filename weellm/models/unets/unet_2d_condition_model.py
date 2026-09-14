@@ -17,13 +17,13 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
+from weellm.io.utils import default_dtype
 from accelerate.utils.modeling import set_module_tensor_to_device
 from diffusers import UNet2DConditionModel
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 

@@ -21,8 +21,8 @@ import torch
 import torch.nn as nn
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import default_dtype, clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import default_dtype, clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 
@@ -70,7 +70,7 @@ class LTX2VideoTransformer3DModelStreamer(BaseTransformerStreamer):
             dk = _remap_ckpt_key(ck)
             remapped[dk] = tensor
 
-        from weellm.memory import place_tensors
+        from weellm.io.memory import place_tensors
         place_tensors(self.model, remapped, self.device, self.dtype, skip_errors=skip_errors)
 
     def _pre_hook(self, module: nn.Module, args):

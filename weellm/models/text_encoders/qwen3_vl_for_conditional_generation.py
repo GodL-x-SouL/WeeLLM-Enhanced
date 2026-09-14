@@ -13,12 +13,12 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
+from weellm.io.utils import default_dtype
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 
-from weellm.utils import clean_memory
-from weellm.seeker import get_seeker
+from weellm.io.utils import clean_memory
+from weellm.io.seeker import get_seeker
 
 
 def _get_resident_keys(seeker) -> List[str]:
@@ -121,7 +121,7 @@ class Qwen3VLForConditionalGenerationStreamer:
             print(f"[DEBUG-VRAM] Before _place_tensors(cpu_sd): {torch.cuda.memory_allocated()/1024**3:.3f} GB")
             self._place_tensors(cpu_sd, device="cpu")
             print(f"[DEBUG-VRAM] After _place_tensors(cpu_sd): {torch.cuda.memory_allocated()/1024**3:.3f} GB")
-            from weellm.memory import pin_module_to_cpu
+            from weellm.io.memory import pin_module_to_cpu
             if hasattr(self._model, "model") and hasattr(self._model.model, "language_model") and hasattr(self._model.model.language_model, "embed_tokens"):
                 pin_module_to_cpu(self._model, "model.language_model.embed_tokens")
             elif hasattr(self._model, "embed_tokens"):

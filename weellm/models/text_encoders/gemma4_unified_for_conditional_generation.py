@@ -7,8 +7,8 @@ from transformers import Gemma2Model, Gemma2Config, Gemma3Config
 from transformers.models.gemma3.modeling_gemma3 import Gemma3TextModel
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from weellm.memory import evict_module, place_tensors
-from weellm.seeker import get_seeker
+from weellm.io.memory import evict_module, place_tensors
+from weellm.io.seeker import get_seeker
 import logging
 
 logger = logging.getLogger("weellm")

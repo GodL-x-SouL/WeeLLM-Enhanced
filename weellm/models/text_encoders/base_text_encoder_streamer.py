@@ -32,9 +32,9 @@ import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 
-from weellm.utils import default_dtype, clean_memory
-from weellm.memory import place_tensors, evict_module
-from weellm.seeker import get_seeker
+from weellm.io.utils import default_dtype, clean_memory
+from weellm.io.memory import place_tensors, evict_module
+from weellm.io.seeker import get_seeker
 
 logger = logging.getLogger("weellm")
 

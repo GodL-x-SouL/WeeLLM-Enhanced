@@ -5,7 +5,7 @@ Detected by: "model.diffusion_model." prefix WITHOUT SDXL markers.
 """
 from typing import Any, Dict, List
 
-from weellm.gguf_keymaps.sdxl import RESNET_TEMPLATE, ATTN_TEMPLATE, _expand_unet_blocks
+from weellm.io.gguf.gguf_keymaps.sdxl import RESNET_TEMPLATE, ATTN_TEMPLATE, _expand_unet_blocks
 
 # ── SD 1.5 block layout ───────────────────────────────────────────────────────
 # (LDM prefix, Diffusers prefix, num_transformer_blocks, is_resnet)

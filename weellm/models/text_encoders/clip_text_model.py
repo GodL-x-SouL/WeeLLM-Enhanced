@@ -18,10 +18,10 @@ import torch.nn as nn
 import types
 
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
-from weellm.memory import place_tensors, evict_module
+from weellm.io.utils import default_dtype
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
+from weellm.io.memory import place_tensors, evict_module
 
 
 def _patch_forward_input_device(model: nn.Module, target_device: str = "cuda"):
@@ -199,7 +199,7 @@ class CLIPTextModelStreamer:
 
         if cpu_sd:
             place_tensors(model, cpu_sd, "cpu", dtype)
-            from weellm.memory import pin_module_to_cpu
+            from weellm.io.memory import pin_module_to_cpu
             if model_has_text_model:
                 pin_module_to_cpu(model, "text_model.embeddings.token_embedding")
             else:

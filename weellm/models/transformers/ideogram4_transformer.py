@@ -19,8 +19,8 @@ import torch.nn as nn
 from accelerate.utils.modeling import set_module_tensor_to_device
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 
@@ -100,7 +100,7 @@ class Ideogram4Transformer2DModelStreamer(BaseTransformerStreamer):
 
         logger.info("Instantiating Ideogram4Transformer2DModel on meta device ...")
         from accelerate import init_empty_weights
-        from weellm.utils import default_dtype
+        from weellm.io.utils import default_dtype
         config = diffusers.Ideogram4Transformer2DModel.load_config(str(model_dir))
         with default_dtype(dtype), init_empty_weights():
             model = diffusers.Ideogram4Transformer2DModel.from_config(config)

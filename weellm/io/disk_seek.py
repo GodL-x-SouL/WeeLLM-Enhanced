@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 
-from weellm.safetensors_base import DTYPE_MAP, SafetensorsBase
+from weellm.io.safetensors_base import DTYPE_MAP, SafetensorsBase
 
 logger = logging.getLogger("weellm")
 

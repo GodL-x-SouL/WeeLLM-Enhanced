@@ -46,7 +46,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from accelerate.utils import set_module_tensor_to_device
-from weellm.memory import place_tensors, evict_module
+from weellm.io.memory import place_tensors, evict_module
 
 logger = logging.getLogger("weellm")
 
@@ -643,7 +643,7 @@ class BaseTransformerStreamer(ABC):
         Returns the ready model.
         """
         from accelerate import init_empty_weights
-        from weellm.utils import default_dtype
+        from weellm.io.utils import default_dtype
 
         logger.info("  Instantiating %s on meta device ...", model_cls.__name__)
         with default_dtype(dtype), init_empty_weights():

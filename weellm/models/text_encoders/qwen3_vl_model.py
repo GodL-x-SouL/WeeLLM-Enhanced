@@ -13,12 +13,12 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
+from weellm.io.utils import default_dtype
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers import AutoConfig, AutoModel
 
-from weellm.utils import clean_memory
-from weellm.seeker import get_seeker
+from weellm.io.utils import clean_memory
+from weellm.io.seeker import get_seeker
 
 
 def _get_resident_keys(seeker) -> List[str]:
@@ -88,7 +88,7 @@ class Qwen3VLModelStreamer:
         
         if cpu_sd:
             self._place_tensors(cpu_sd, device="cpu")
-            from weellm.memory import pin_module_to_cpu
+            from weellm.io.memory import pin_module_to_cpu
             if hasattr(self._model, "language_model") and hasattr(self._model.language_model, "embed_tokens"):
                 pin_module_to_cpu(self._model, "language_model.embed_tokens")
             elif hasattr(self._model, "embed_tokens"):

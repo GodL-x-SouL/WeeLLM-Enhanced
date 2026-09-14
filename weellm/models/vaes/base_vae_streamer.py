@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from accelerate.utils.modeling import set_module_tensor_to_device
 
-from weellm.utils import clean_memory, report_memory
+from weellm.io.utils import clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 

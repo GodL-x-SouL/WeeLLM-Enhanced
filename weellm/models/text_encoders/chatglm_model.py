@@ -12,8 +12,8 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
 
-from weellm.utils import default_dtype
-from weellm.memory import place_tensors, pin_module_to_cpu
+from weellm.io.utils import default_dtype
+from weellm.io.memory import place_tensors, pin_module_to_cpu
 from weellm.models.text_encoders.base_text_encoder_streamer import BaseLazyDecoderStreamer
 
 
@@ -184,7 +184,7 @@ class ChatGLMModelStreamer(BaseLazyDecoderStreamer):
         idx = getattr(module, "_te_layer_idx", -1)
         if idx == -1: return output
 
-        from weellm.memory import evict_module
+        from weellm.io.memory import evict_module
         evict_module(module)
         if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()

@@ -24,8 +24,8 @@ from typing import Optional, Union
 
 import torch
 
-from weellm.utils import clean_memory, report_memory, resolve_model_path
-from weellm.memory import evict_module
+from weellm.io.utils import clean_memory, report_memory, resolve_model_path
+from weellm.io.memory import evict_module
 
 logger = logging.getLogger("weellm")
 
@@ -506,7 +506,7 @@ class WeeBasePipeline:
     @staticmethod
     def _load_vae(model_dir: Path, device: str, torch_dtype: torch.dtype, cache_to_ram: bool, subfolder: str = "vae", vae_path_override: Optional[Union[str, Path]] = None):
         import json
-        from weellm.seeker import override_weights_path
+        from weellm.io.seeker import override_weights_path
         
         vae_dir = model_dir / subfolder
         config_path = vae_dir / "config.json"
@@ -601,7 +601,7 @@ class WeeBasePipeline:
             else:
                 te_path = str(local_te_path)
 
-            from .seeker import override_weights_path
+            from .io.seeker import override_weights_path
             
             with override_weights_path(override_path, subfolder=key):
                 if "Qwen" in hf_cls_name or "Mistral" in hf_cls_name or "Llama" in hf_cls_name:
@@ -671,7 +671,7 @@ class WeeBasePipeline:
         module                   = importlib.import_module(module_path)
         transformer_cls_streamer = getattr(module, transformer_class_name + "Streamer")
 
-        from .seeker import override_weights_path
+        from .io.seeker import override_weights_path
 
         with override_weights_path(transformer_path_override, subfolder=transformer_key):
             if transformer_key == "unet":

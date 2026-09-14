@@ -78,8 +78,8 @@ class LTX2ConnectorsStreamer(BaseTransformerStreamer):
     ):
         from pathlib import Path
         from accelerate import init_empty_weights
-        from weellm.seeker import get_seeker
-        from weellm.utils import default_dtype
+        from weellm.io.seeker import get_seeker
+        from weellm.io.utils import default_dtype
         
         transformer_dir = Path(transformer_dir)
         seeker = get_seeker(transformer_dir, cache_to_ram=cache_to_ram)

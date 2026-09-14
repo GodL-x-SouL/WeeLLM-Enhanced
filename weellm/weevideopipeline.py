@@ -307,7 +307,7 @@ class WeeVideoPipeline(WeeBasePipeline):
         if _ep_hit:
             logger.info("[VideoCache] Text encoder output restored from cache — skipped entirely.")
             try:
-                from weellm.memory import evict_module as _evict_te
+                from weellm.io.memory import evict_module as _evict_te
                 _te_names = ("text_encoder", "text_encoder_2", "text_encoder_3", "text_encoder_4")
                 for _te_name in _te_names:
                     _te_mod = getattr(_underlying, _te_name, None)
@@ -353,7 +353,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                     _vae = _underlying.vae
                     _vproc = getattr(_underlying, "video_processor", None)
                     
-                    from weellm.memory import evict_module as _evict
+                    from weellm.io.memory import evict_module as _evict
                     for _tr_name in ("transformer", "unet", "connectors"):
                         _tr = getattr(_underlying, _tr_name, None)
                         if _tr is not None: _evict(_tr)
@@ -494,7 +494,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                     
                     _lat = self._preprocess_latents_for_decode(_lat, _vae, kwargs)
                             
-                    from weellm.memory import evict_module
+                    from weellm.io.memory import evict_module
                     for _comp in ["transformer", "text_encoder", "text_encoder_2", "text_encoder_3", "text_encoder_4", "connectors"]:
                         _c = getattr(_underlying, _comp, None)
                         if _c: evict_module(_c)

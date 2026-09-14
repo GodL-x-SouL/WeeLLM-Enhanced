@@ -20,8 +20,8 @@ import torch
 import torch.nn as nn
 
 from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
-from weellm.seeker import get_seeker
-from weellm.utils import default_dtype, clean_memory, report_memory
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import default_dtype, clean_memory, report_memory
 
 logger = logging.getLogger("weellm")
 
@@ -133,7 +133,7 @@ class MiniMaxH3Transformer3DModelStreamer(BaseTransformerStreamer):
 
     def apply_state_dict(self, state_dict: Dict[str, torch.Tensor], skip_errors: bool = False) -> None:
         """Remap checkpoint keys → diffusers names, then split fused qkv → to_q/k/v before placement."""
-        from weellm.memory import place_tensors
+        from weellm.io.memory import place_tensors
 
         remapped: Dict[str, torch.Tensor] = {}
         for ck, tensor in state_dict.items():
@@ -177,7 +177,7 @@ class MiniMaxH3Transformer3DModelStreamer(BaseTransformerStreamer):
             else:
                 remapped[dk] = tensor
 
-        from weellm.memory import place_tensors
+        from weellm.io.memory import place_tensors
         place_tensors(self.model, remapped, self.device, self.dtype, skip_errors=True)
 
     def _pre_hook(self, module: nn.Module, args):
@@ -212,7 +212,7 @@ class MiniMaxH3Transformer3DModelStreamer(BaseTransformerStreamer):
         # We translate checkpoint keys → diffusers names when loading tensors.
         from diffusers import MiniMaxH3Transformer3DModel
         from accelerate import init_empty_weights
-        from weellm.utils import default_dtype
+        from weellm.io.utils import default_dtype
         logger.info("  Instantiating MiniMaxH3Transformer3DModel on meta device ...")
         cfg = MiniMaxH3Transformer3DModel.load_config(str(transformer_dir))
         with init_empty_weights(), default_dtype(dtype):

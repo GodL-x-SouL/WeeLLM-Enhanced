@@ -16,15 +16,15 @@ more-general ones to avoid false matches.
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from weellm.gguf_keymaps.t5     import T5KeyMap
-from weellm.gguf_keymaps.llama  import LlamaKeyMap
-from weellm.gguf_keymaps.flux   import FluxKeyMap
-from weellm.gguf_keymaps.sdxl   import SDXLKeyMap
-from weellm.gguf_keymaps.sd15   import SD15KeyMap
-from weellm.gguf_keymaps.krea2  import Krea2KeyMap
-from weellm.gguf_keymaps.zimage import ZImageKeyMap
-from weellm.gguf_keymaps.minimax_h3 import MiniMaxH3KeyMap
-from weellm.gguf_keymaps.qwen3vl import Qwen3VLKeyMap
+from weellm.io.gguf.gguf_keymaps.t5     import T5KeyMap
+from weellm.io.gguf.gguf_keymaps.llama  import LlamaKeyMap
+from weellm.io.gguf.gguf_keymaps.flux   import FluxKeyMap
+from weellm.io.gguf.gguf_keymaps.sdxl   import SDXLKeyMap
+from weellm.io.gguf.gguf_keymaps.sd15   import SD15KeyMap
+from weellm.io.gguf.gguf_keymaps.krea2  import Krea2KeyMap
+from weellm.io.gguf.gguf_keymaps.zimage import ZImageKeyMap
+from weellm.io.gguf.gguf_keymaps.minimax_h3 import MiniMaxH3KeyMap
+from weellm.io.gguf.gguf_keymaps.qwen3vl import Qwen3VLKeyMap
 
 logger = logging.getLogger("weellm")
 
