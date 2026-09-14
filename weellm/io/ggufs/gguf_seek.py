@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from weellm.io.gguf.gguf_keymaps import build_remap_fn
+from weellm.io.ggufs.keymaps import build_remap_fn
 
 logger = logging.getLogger("weellm")
 
@@ -97,7 +97,7 @@ class GGUFSeeker:
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, torch.Tensor]:
         import gguf as _gguf_lib
-        from weellm.io.gguf_dequant import dequantize_tensor, TORCH_COMPATIBLE_QTYPES
+        from weellm.io.ggufs.gguf_dequant import dequantize_tensor, TORCH_COMPATIBLE_QTYPES
 
         result: Dict[str, torch.Tensor] = {}
         target_dtype = dtype if dtype is not None else torch.bfloat16

@@ -67,7 +67,7 @@ def get_seeker(model_dir: Union[str, Path], cache_to_ram: bool = False):
 
     # ── GGUF: single-file path ending in .gguf ────────────────────────────────
     if model_dir_path.is_file() and model_dir_path.suffix.lower() == ".gguf":
-        from weellm.io.gguf_seek import GGUFSeeker
+        from weellm.io.ggufs.gguf_seek import GGUFSeeker
         return GGUFSeeker(model_dir_path)
         
     # ── Single File Direct Hub Download ──────────────────────────────────────
@@ -87,7 +87,7 @@ def get_seeker(model_dir: Union[str, Path], cache_to_ram: bool = False):
             
     # ── GGUF Initialization ──────────────────────────────────────────────────
     if model_dir_path.is_file() and model_dir_path.suffix.lower() == ".gguf":
-        from weellm.io.gguf_seek import GGUFSeeker
+        from weellm.io.ggufs.gguf_seek import GGUFSeeker
         return GGUFSeeker(model_dir_path)
 
     original_model_dir_str = str(model_dir).replace("\\", "/")
@@ -166,8 +166,8 @@ def get_seeker(model_dir: Union[str, Path], cache_to_ram: bool = False):
             model_dir_path = model_dir_path / final_target_subfolder
 
     if cache_to_ram:
-        from weellm.io.ram_seek import SafetensorsRAMSeeker
+        from weellm.io.safetensors.ram_seek import SafetensorsRAMSeeker
         return SafetensorsRAMSeeker(model_dir_path)
     else:
-        from weellm.io.disk_seek import SafetensorsDiskSeeker
+        from weellm.io.safetensors.disk_seek import SafetensorsDiskSeeker
         return SafetensorsDiskSeeker(model_dir_path)

@@ -1,4 +1,4 @@
-from typing import Set, Callable
+from typing import Set, List, Tuple, Any, Callable
 
 class DiffusersFallbackLoRAKeyMap:
     NAME = "diffusers_fallback"
