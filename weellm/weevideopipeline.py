@@ -330,7 +330,7 @@ class WeeVideoPipeline(WeeBasePipeline):
         if lora_weights is not None:
             logger.info(f"Loading LoRA weights from {lora_weights}")
             
-            from weellm.models.loras.lora_loader import GenericLazyLoRALoader
+            from weellm.models.loras.lora_streamer import GenericLazyLoRALoader
             lazy_loader = GenericLazyLoRALoader(lora_weights)
             
             # 1. Apply to Transformer
