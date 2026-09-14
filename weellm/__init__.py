@@ -49,7 +49,7 @@ __all__ = [
     "Krea2Transformer2DModelStreamer",
     "LongCatImageTransformer2DModelStreamer",
     "LTX2ConnectorsStreamer",
-    "LTX2DiTModelStreamer",
+    "LTX2VideoTransformer3DModelStreamer",
     "MiniMaxH3Transformer3DModelStreamer",
     # Text Encoders
     "ChatGLMModelStreamer",
@@ -98,7 +98,7 @@ from .models.transformers.ernie_image_transformer_2d_model import ErnieImageTran
 from .models.transformers.krea2_transformer_2d_model import Krea2Transformer2DModelStreamer  # noqa: E402
 from .models.transformers.longcat_transformer_2d_model import LongCatImageTransformer2DModelStreamer  # noqa: E402
 from .models.transformers.ltx2_connectors import LTX2ConnectorsStreamer  # noqa: E402
-from .models.transformers.ltx2_dit_model import LTX2DiTModelStreamer  # noqa: E402
+from .models.transformers.ltx2_video_transformer_3d_model import LTX2VideoTransformer3DModelStreamer  # noqa: E402
 from .models.transformers.minimax_h3_transformer_3d_model import MiniMaxH3Transformer3DModelStreamer  # noqa: E402
 
 # Text Encoders

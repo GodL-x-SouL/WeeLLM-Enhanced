@@ -28,16 +28,29 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
             def __call__(self, *args, **kwargs): return None
             def predict_num_frames(self, *args, **kwargs): return 121
             def to(self, *args, **kwargs): return self
-            
-        kwargs.setdefault("vocoder", DummyComponent())
         kwargs.setdefault("duration_head", DummyComponent())
         kwargs.setdefault("prompt_enhancer", DummyComponent())
         
-        # 2. Load connectors via streamer if they exist in the model
+        # 2. Load extra LTX components if they exist
         index_path = model_dir_path / "model_index.json"
         if index_path.exists():
             with open(index_path, "r", encoding="utf-8") as f:
                 index = json.load(f)
+            
+            if "vocoder" in index and "vocoder" not in kwargs:
+                try:
+                    from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
+                    device = kwargs.get("device", "cuda")
+                    dtype = kwargs.get("torch_dtype", torch.bfloat16)
+                    vocoder = LTX2VocoderWithBWE.from_pretrained(
+                        model_dir_path / "vocoder", torch_dtype=dtype
+                    ).to(device)
+                    kwargs["vocoder"] = vocoder
+                except Exception as e:
+                    logger.warning("Failed to load vocoder: %s", e)
+                    kwargs.setdefault("vocoder", DummyComponent())
+            else:
+                kwargs.setdefault("vocoder", DummyComponent())
             
             if "connectors" in index and "connectors" not in kwargs:
                 try:
@@ -56,7 +69,19 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 except Exception as e:
                     logger.warning("Failed to load connectors in WeeLTX2Pipeline: %s", e)
                     
-        return super().from_pretrained(model_dir, **kwargs)
+        pipe = super().from_pretrained(model_dir, **kwargs)
+        
+        # Override the base pipeline's default VAE chunking because LTX-2.5 is sensitive to it
+        if hasattr(pipe._pipeline.vae, "use_framewise_decoding"):
+            pipe._pipeline.vae.use_framewise_decoding = False
+            logger.warning(
+                "\n[WARNING] LTX-2.5 VAE chunking (framewise decoding) has been disabled by default. "
+                "Chunking causes severe temporal jitter/seams in LTX-2.5. "
+                "Note: This processes all frames at once and requires significantly more memory, "
+                "which may trigger system RAM swap on low-VRAM machines."
+            )
+            
+        return pipe
 
     def __call__(self, prompt: str, **kwargs):
         # 1. Handle LTX-specific 8k+1 frame snapping

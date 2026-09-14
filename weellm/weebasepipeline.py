@@ -86,7 +86,7 @@ _TR_MAP = {
     "LongCatImageTransformer2DModel":      "weellm.models.transformers.longcat_transformer_2d_model",
     "Krea2Transformer2DModel":             "weellm.models.transformers.krea2_transformer_2d_model",
     "MiniMaxH3Transformer3DModel":         "weellm.models.transformers.minimax_h3_transformer_3d_model",
-    "LTX2VideoTransformer3DModel":         "weellm.models.transformers.ltx2_dit_model",
+    "LTX2VideoTransformer3DModel":         "weellm.models.transformers.ltx2_video_transformer_3d_model",
 }
 
 
@@ -784,16 +784,19 @@ class WeeBasePipeline:
             _move_scheduler(pipeline.scheduler, device)
 
         if hasattr(pipeline.scheduler, "set_timesteps"):
-            original_set_timesteps = pipeline.scheduler.set_timesteps
-            original_step          = pipeline.scheduler.step
+            original_set_timesteps_func = pipeline.scheduler.set_timesteps.__func__
+            original_step_func          = pipeline.scheduler.step.__func__
 
-            def safe_set_timesteps(num_inference_steps=None, device=None, sigmas=None, mu=None, timesteps=None):
+            def safe_set_timesteps(scheduler_self, num_inference_steps=None, device=None, sigmas=None, mu=None, timesteps=None, **kwargs):
                 # Build kwargs only for args the scheduler actually accepts.
                 import inspect
-                sig    = inspect.signature(original_set_timesteps)
-                params = sig.parameters
+                params = inspect.signature(original_set_timesteps_func).parameters
+                
+                if device is None:
+                    device = pipeline.device
+                
                 kw: dict = {}
-                if "num_inference_steps" in params:
+                if num_inference_steps is not None and "num_inference_steps" in params:
                     kw["num_inference_steps"] = num_inference_steps
                 if "device" in params:
                     kw["device"] = device
@@ -803,12 +806,13 @@ class WeeBasePipeline:
                     kw["mu"] = mu
                 if "timesteps" in params and timesteps is not None:
                     kw["timesteps"] = timesteps
-                result = original_set_timesteps(**kw)
-                _move_scheduler(pipeline.scheduler, device)
+                result = original_set_timesteps_func(scheduler_self, **kw)
+                _move_scheduler(scheduler_self, device)
 
                 return result
 
-            def safe_step(*args, **kwargs):
+            original_step_func = pipeline.scheduler.step.__func__
+            def safe_step(scheduler_self, *args, **kwargs):
                 args = list(args)
                 tensor_device = None
                 for value in args[:3]:
@@ -824,7 +828,7 @@ class WeeBasePipeline:
                 if tensor_device is None:
                     tensor_device = device
 
-                _move_scheduler(pipeline.scheduler, tensor_device)
+                _move_scheduler(scheduler_self, tensor_device)
                 for i, value in enumerate(args[:3]):
                     if torch.is_tensor(value) and value.device.type != tensor_device:
                         args[i] = value.to(tensor_device)
@@ -832,15 +836,13 @@ class WeeBasePipeline:
                     if torch.is_tensor(value) and value.device.type != tensor_device:
                         kwargs[k] = value.to(tensor_device)
 
-                result = original_step(*args, **kwargs)
-                _move_scheduler(pipeline.scheduler, tensor_device)
+                result = original_step_func(scheduler_self, *args, **kwargs)
+                _move_scheduler(scheduler_self, tensor_device)
                 return result
 
-            # Assign as plain functions (not bound methods) — the originals are
-            # already bound to the scheduler object, so wrapping them this way
-            # avoids the self_obj first-arg inconsistency.
-            pipeline.scheduler.set_timesteps = safe_set_timesteps
-            pipeline.scheduler.step          = safe_step
+            import types
+            pipeline.scheduler.set_timesteps = types.MethodType(safe_set_timesteps, pipeline.scheduler)
+            pipeline.scheduler.step          = types.MethodType(safe_step, pipeline.scheduler)
 
     @staticmethod
     def _patch_pipeline_to(pipeline) -> None:
