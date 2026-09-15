@@ -15,6 +15,16 @@ from weellm.pipelines.weebasepipeline import WeeBasePipeline
 
 logger = logging.getLogger("weellm")
 
+# ---------------------------------------------------------------------------
+# Pipeline class name → (module path, class name)
+# ---------------------------------------------------------------------------
+_VIDEO_MAP = {
+    "LTX2Pipeline":("weellm.pipelines.video.adapters.ltx2_pipeline","WeeLTX2Pipeline"),
+    "MiniMaxH3ModularPipeline":("weellm.pipelines.video.adapters.minimax_h3_modular_pipeline","WeeMiniMaxPipeline"),
+    "WanPipeline":("weellm.pipelines.video.weevideopipeline","WeeVideoPipeline"),
+    "CogVideoXPipeline":("weellm.pipelines.video.weevideopipeline","WeeVideoPipeline"),
+}
+
 class WeeVideoResult:
     """
     A unified wrapper for generated video frames and audio (if any),
@@ -103,38 +113,15 @@ class WeeVideoPipeline(WeeBasePipeline):
             with open(index_path, "r", encoding="utf-8") as f:
                 class_name = json.load(f).get("_class_name", "")
                 
-        VIDEO_MODELS = {
-            "LTX2Pipeline": {
-                "log": "Text-to-Video (LTX-2.5)",
-                "module": "weellm.pipelines.video.ltx2_pipeline",
-                "class": "WeeLTX2Pipeline",
-            },
-            "MiniMaxH3ModularPipeline": {
-                "log": "Text-to-Video+Audio (MiniMax-H3)",
-                "module": "weellm.pipelines.video.minimax_h3_modular_pipeline",
-                "class": "WeeMiniMaxPipeline",
-            },
-            "WanPipeline": {
-                "log": "Text-to-Video (Wan)",
-                "module": "weellm.weevideopipeline",
-                "class": "WeeVideoPipeline",
-            },
-            "CogVideoXPipeline": {
-                "log": "Text-to-Video (CogVideoX)",
-                "module": "weellm.weevideopipeline",
-                "class": "WeeVideoPipeline",
-            },
-        }
-
         # If this method is called strictly on WeeVideoPipeline (the base), do the routing.
         # But if it's called on a subclass directly (e.g. WeeLTX2Pipeline.from_pretrained),
         # we skip the routing to avoid infinite loops and just construct it.
-        if cls is WeeVideoPipeline and class_name in VIDEO_MODELS:
-            info = VIDEO_MODELS[class_name]
-            logger.info("  Mode:     %s", info["log"])
-            
-            module = importlib.import_module(info["module"])
-            pipeline_class = getattr(module, info["class"])
+        if cls is WeeVideoPipeline and class_name in _VIDEO_MAP:
+            module_path, class_name_str = _VIDEO_MAP[class_name]
+            logger.info("  Mode:     %s", class_name)
+
+            module = importlib.import_module(module_path)
+            pipeline_class = getattr(module, class_name_str)
             return pipeline_class.from_pretrained(model_dir, **kwargs)
             
         return super().from_pretrained(model_dir, **kwargs)
