@@ -31,6 +31,17 @@ __all__ = [
     # Backward-compat aliases
     "WeePipeline",
     "WeeImagePipeline",
+    # IO — memory & placement
+    "place_tensors",
+    "evict_module",
+    "pin_module_to_cpu",
+    "get_seeker",
+    "override_weights_path",
+    "SafetensorsBase",
+    "SafetensorsDiskSeeker",
+    "SafetensorsRAMSeeker",
+    "GGUFSeeker",
+    "dequantize_tensor",
     # VAE
     "AutoencoderKL",
     "AutoencoderKLMiniMaxH3Streamer",
@@ -78,6 +89,15 @@ from .pipelines.weebasepipeline import WeeBasePipeline  # noqa: E402
 from .pipelines.image.weetexttoimagepipeline import WeeTextToImagePipeline, WeePipeline  # noqa: E402
 from .pipelines.image.weeimagetoimagepipeline import WeeImageToImagePipeline, WeeImagePipeline  # noqa: E402
 from .pipelines.video.weevideopipeline import WeeVideoPipeline  # noqa: E402
+
+# IO — memory & tensor placement 
+from .io.memory import place_tensors, evict_module, pin_module_to_cpu  # noqa: E402
+from .io.seeker import get_seeker, override_weights_path  # noqa: E402
+from .io.safetensors.safetensors_base import SafetensorsBase  # noqa: E402
+from .io.safetensors.disk_seek import SafetensorsDiskSeeker  # noqa: E402
+from .io.safetensors.ram_seek import SafetensorsRAMSeeker  # noqa: E402
+from .io.ggufs.gguf_seek import GGUFSeeker  # noqa: E402
+from .io.ggufs.gguf_dequant import dequantize_tensor  # noqa: E402
 
 # VAE
 from .models.vaes.autoencoder_kl import AutoencoderKL  # noqa: E402

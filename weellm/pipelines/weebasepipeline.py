@@ -332,13 +332,26 @@ class WeeBasePipeline:
 
         # ── Step 4: Transformer / UNet ──────────────────────────────────
         logger.info("\n[4/4] Preparing Transformer / UNet ...")
-        
-        unet_path = diffusers_kwargs.pop("unet_path", None)
-        transformer_path = diffusers_kwargs.pop("transformer_path", None)
+
+        # Always pop both so neither leaks into diffusers kwargs.
+        # Prefer the one that matches the actual component key from model_index.json.
+        # If the user passes the "wrong" one (e.g. unet_path on a transformer model),
+        # we accept it as a backward-compatible fallback with a warning.
+        _transformer_key = "transformer" if "transformer" in index else "unet"
+        _unet_key        = "unet"        if _transformer_key == "transformer" else "transformer"
+        transformer_path_override = diffusers_kwargs.pop(f"{_transformer_key}_path", None)
+        _compat_override          = diffusers_kwargs.pop(f"{_unet_key}_path", None)
+        if transformer_path_override is None and _compat_override is not None:
+            logger.warning(
+                "[WeeLLM] '%s_path' was passed but this model uses '%s'. "
+                "Accepting it as a compatibility fallback — prefer '%s_path' to silence this warning.",
+                _unet_key, _transformer_key, _transformer_key,
+            )
+            transformer_path_override = _compat_override
         
         transformer_key, transformer_streamer = cls._load_transformer(
             model_dir_path, index, device, effective_dtype, prefetch, cache_to_ram,
-            transformer_path_override=unet_path if "unet" in index else transformer_path
+            transformer_path_override=transformer_path_override
         )
         tr_model = getattr(transformer_streamer, "model", getattr(transformer_streamer, "_model", transformer_streamer))
         tr_model = cls._patch_to(tr_model)
