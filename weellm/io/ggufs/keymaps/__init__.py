@@ -20,6 +20,7 @@ from weellm.io.ggufs.keymaps.t5     import T5KeyMap
 from weellm.io.ggufs.keymaps.llama  import LlamaKeyMap
 from weellm.io.ggufs.keymaps.flux   import FluxKeyMap
 from weellm.io.ggufs.keymaps.flux2  import Flux2KeyMap
+from weellm.io.ggufs.keymaps.glm    import GLMKeyMap
 from weellm.io.ggufs.keymaps.sd3    import SD3KeyMap
 from weellm.io.ggufs.keymaps.sdxl   import SDXLKeyMap
 from weellm.io.ggufs.keymaps.sd15   import SD15KeyMap
@@ -33,6 +34,7 @@ logger = logging.getLogger("weellm")
 # Ordered: first match wins.  Put more-specific detectors at the top.
 _REGISTRY = [
     T5KeyMap,       # enc.blk.*  — must come before llama (no overlap, but explicit ordering)
+    GLMKeyMap,      # GLM text encoder: token_embd + blk.* + ffn_gate
     LlamaKeyMap,    # blk.*
     Flux2KeyMap,    # Flux.2 Klein: 8 double + 24 single blocks
     FluxKeyMap,     # double_blocks.*
@@ -77,6 +79,7 @@ __all__ = [
     "build_remap_fn",
     "T5KeyMap",
     "LlamaKeyMap",
+    "GLMKeyMap",
     "FluxKeyMap",
     "Flux2KeyMap",
     "SD3KeyMap",
