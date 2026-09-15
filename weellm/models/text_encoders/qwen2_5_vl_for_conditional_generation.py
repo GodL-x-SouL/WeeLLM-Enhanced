@@ -49,7 +49,7 @@ def _get_resident_keys(seeker, is_edit_model: bool = False) -> List[str]:
             continue
         if k.startswith("lm_head."):
             continue
-        if not is_edit_model and k.startswith("visual."):
+        if not is_edit_model and (k.startswith("visual.") or k.startswith("model.visual.")):
             continue
         keys.append(k)
     return keys
@@ -59,6 +59,8 @@ def map_qwen_key(k: str) -> str:
     """Map safetensors keys to Qwen2_5_VLForConditionalGeneration module names."""
     if k.startswith("visual."):
         return "model." + k
+    elif k.startswith("model.visual."):
+        return k
     elif k.startswith("model."):
         return k.replace("model.", "model.language_model.", 1)
     return k
