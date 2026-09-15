@@ -3,6 +3,14 @@
 from typing import Any, Dict, List
 
 
+_SWAP_SCALE_SHIFT_GGUF_KEYS = frozenset({
+    "final_layer.adaLN_modulation.1.bias",
+    "final_layer.adaLN_modulation.1.weight",
+    "joint_blocks.23.context_block.adaLN_modulation.1.bias",
+    "joint_blocks.23.context_block.adaLN_modulation.1.weight",
+})
+
+
 class SD3KeyMap:
     NAME = "sd3"
 
@@ -107,3 +115,12 @@ class SD3KeyMap:
                     ]
 
         return remap
+
+    @staticmethod
+    def postprocess_tensor(diffusers_key: str, tensor: Any, orig_name: str) -> Any:
+        if orig_name in _SWAP_SCALE_SHIFT_GGUF_KEYS:
+            import torch
+
+            half = tensor.shape[0] // 2
+            return torch.cat([tensor[half:], tensor[:half]], dim=0).contiguous()
+        return tensor
