@@ -23,6 +23,7 @@ IMG2IMG_MAPPING = {
 }
 
 class WeeImageToImagePipeline(WeeBasePipeline):
+    _is_edit_model = True
     """
     Image-to-Image WeeImageToImagePipeline.
     """
