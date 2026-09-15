@@ -98,6 +98,17 @@ class SD3KeyMap:
             for source, target in direct.items():
                 remap[source] = [(target, None)]
 
+            for stream in ("x_block", "context_block"):
+                source_attn_prefix = f"{source_prefix}.{stream}.attn"
+                target_attn_prefix = f"{target_prefix}.attn"
+                norm_prefix = "norm_added" if stream == "context_block" else "norm"
+                remap[f"{source_attn_prefix}.ln_q.weight"] = [
+                    (f"{target_attn_prefix}.{norm_prefix}_q.weight", None)
+                ]
+                remap[f"{source_attn_prefix}.ln_k.weight"] = [
+                    (f"{target_attn_prefix}.{norm_prefix}_k.weight", None)
+                ]
+
             for stream, target_prefix_part in (
                 ("x_block", "attn"),
                 ("context_block", "attn"),
@@ -113,6 +124,18 @@ class SD3KeyMap:
                         (f"{target_prefix}.{target_prefix_part}.{name}.{suffix}", (split, 3))
                         for split, name in enumerate(target_names)
                     ]
+
+            dual_source = f"{source_prefix}.x_block.attn2"
+            dual_target = f"{target_prefix}.attn2"
+            for suffix in ("weight", "bias"):
+                remap[f"{dual_source}.qkv.{suffix}"] = [
+                    (f"{dual_target}.to_{name}.{suffix}", (split, 3))
+                    for split, name in enumerate(("q", "k", "v"))
+                ]
+            remap[f"{dual_source}.proj.weight"] = [(f"{dual_target}.to_out.0.weight", None)]
+            remap[f"{dual_source}.proj.bias"] = [(f"{dual_target}.to_out.0.bias", None)]
+            remap[f"{dual_source}.ln_q.weight"] = [(f"{dual_target}.norm_q.weight", None)]
+            remap[f"{dual_source}.ln_k.weight"] = [(f"{dual_target}.norm_k.weight", None)]
 
         return remap
 
