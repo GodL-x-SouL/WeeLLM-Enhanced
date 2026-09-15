@@ -49,7 +49,7 @@ def _get_resident_keys(seeker, is_edit_model: bool = False) -> List[str]:
             continue
         if k.startswith("lm_head."):
             continue
-        if k.startswith("visual."):
+        if not is_edit_model and k.startswith("visual."):
             continue
         keys.append(k)
     return keys
