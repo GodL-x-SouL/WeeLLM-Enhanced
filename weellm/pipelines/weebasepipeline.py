@@ -181,6 +181,45 @@ class WeeBasePipeline:
                 logger.info("[WeeLLM] Disabling '_auto_resize' to prevent catastrophic sequence length OOMs on 4GB GPUs.")
                 kwargs["_auto_resize"] = False
                 
+        # --- Memory Overhead Estimation ---
+        est_w = kwargs.get("width", 1024)
+        est_h = kwargs.get("height", 1024)
+        if "image" in kwargs and kwargs["image"] is not None:
+            import PIL.Image
+            img = kwargs["image"]
+            if isinstance(img, list):
+                img = img[0]
+            if isinstance(img, PIL.Image.Image):
+                est_w, est_h = img.size
+
+        # Universally determine VAE scale and patch size purely from component configurations.
+        vae_scale = getattr(self._pipeline, "vae_scale_factor", None)
+        if vae_scale is None:
+            if hasattr(self._pipeline, "vae") and hasattr(self._pipeline.vae, "config") and hasattr(self._pipeline.vae.config, "block_out_channels"):
+                vae_scale = max(1, 2 ** (len(self._pipeline.vae.config.block_out_channels) - 1))
+            else:
+                vae_scale = 8
+        
+        patch_size = 1
+        transformer = getattr(self._pipeline, "transformer", getattr(self._pipeline, "unet", None))
+        if transformer is not None and hasattr(transformer, "config"):
+            if hasattr(transformer.config, "patch_size"):
+                patch_size = transformer.config.patch_size
+        
+        tokens = (est_h // vae_scale // patch_size) * (est_w // vae_scale // patch_size)
+        
+        # Estimate attention memory: roughly ~500KB per token based on SDPA overheads
+        estimated_attention_bytes = tokens * 500 * 1024
+        
+        # Estimate resident vision tower overhead if this is an image-to-image task
+        has_image = kwargs.get("image") is not None
+        estimated_vision_bytes = int(1.5 * 1024**3) if has_image else 0
+        
+        from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
+        BaseTransformerStreamer._estimated_vram_overhead_bytes = estimated_attention_bytes + estimated_vision_bytes
+        BaseTransformerStreamer._estimated_ram_overhead_bytes = estimated_attention_bytes
+        # ----------------------------------
+        
         try:
             return self._pipeline(*args, **kwargs)
         except torch.cuda.OutOfMemoryError:

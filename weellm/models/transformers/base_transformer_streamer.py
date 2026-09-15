@@ -70,6 +70,11 @@ class BaseTransformerStreamer(ABC):
     depth, VRAM calibration, executor management — is handled here.
     """
 
+    _global_vram_budget_gb: Optional[float] = None
+    _global_ram_budget_gb: Optional[float] = None
+    _estimated_vram_overhead_bytes: int = 0
+    _estimated_ram_overhead_bytes: int = 0
+
     def __init__(
         self,
         model: nn.Module,
@@ -171,7 +176,8 @@ class BaseTransformerStreamer(ABC):
                     else:
                         free_vram, _ = torch.cuda.mem_get_info(self.device)
 
-                    if b0_bytes + _VRAM_SAFETY_BYTES < free_vram:
+                    estimated_overhead = getattr(self.__class__, "_estimated_vram_overhead_bytes", 0)
+                    if b0_bytes + _VRAM_SAFETY_BYTES + estimated_overhead < free_vram:
                         self._h2d_futures[b0_name] = self._h2d_executor.submit(
                             self._do_h2d, b0_name, b0_keys
                         )
@@ -183,10 +189,10 @@ class BaseTransformerStreamer(ABC):
                     else:
                         logger.debug(
                             "[Streamer] Skipping eager H2D seed for block[0] '%s' (%.0f MB) — "
-                            "only %.0f MB free VRAM (need %.0f MB + safety margin). "
+                            "only %.0f MB free VRAM (need %.0f MB + safety margin + overhead). "
                             "Pre-hook will load lazily.",
                             b0_name, b0_bytes / 1e6, free_vram / 1e6,
-                            (b0_bytes + _VRAM_SAFETY_BYTES) / 1e6,
+                            (b0_bytes + _VRAM_SAFETY_BYTES + estimated_overhead) / 1e6,
                         )
                 except Exception:
                     pass  # If budget check fails for any reason, fall back to lazy loading
@@ -229,17 +235,20 @@ class BaseTransformerStreamer(ABC):
             else:
                 available = psutil.virtual_memory().available
             
-            usable = max(0, available - _RAM_SAFETY_BYTES)
+            
+            estimated_ram_overhead = getattr(self.__class__, "_estimated_ram_overhead_bytes", 0)
+            usable = max(0, available - _RAM_SAFETY_BYTES - estimated_ram_overhead)
             depth = max(1, min(_MAX_PREFETCH_DEPTH, int(usable // max_block_bytes)))
         except ImportError:
             depth = 1
 
         logger.info(
             "[Streamer] Adaptive prefetch depth: %d  "
-            "(largest block: %.0f MB, available RAM limit: %.1f GB)",
+            "(largest block: %.0f MB, available RAM limit: %.1f GB, overhead: %.1f GB)",
             depth,
             max_block_bytes / 1e6,
             (available - _RAM_SAFETY_BYTES) / 1e9 if 'available' in dir() else 0,
+            estimated_ram_overhead / 1e9 if 'estimated_ram_overhead' in dir() else 0,
         )
         return depth
 
@@ -526,8 +535,9 @@ class BaseTransformerStreamer(ABC):
                 if p.device.type != "meta"
             )
             
-            # Predict if VRAM can hold (current max_reserved + 1 extra block size + safety margin)
-            predicted_peak = max_reserved + block_size + _VRAM_SAFETY_BYTES
+            # Predict if VRAM can hold (current max_reserved + 1 extra block size + safety margin + overhead)
+            estimated_overhead = getattr(self.__class__, "_estimated_vram_overhead_bytes", 0)
+            predicted_peak = max_reserved + block_size + _VRAM_SAFETY_BYTES + estimated_overhead
             
             if predicted_peak > total_vram:
                 self._double_buffering_enabled = False
@@ -583,7 +593,8 @@ class BaseTransformerStreamer(ABC):
                     fragmentation_margin = 1024**3  # 1 GB
 
                 allocator_slack = max(0, current_reserved - current_allocated)
-                runtime_headroom = non_pytorch_vram + allocator_slack + fragmentation_margin
+                estimated_overhead = getattr(self.__class__, "_estimated_vram_overhead_bytes", 0)
+                runtime_headroom = non_pytorch_vram + allocator_slack + fragmentation_margin + estimated_overhead
                 self._cache_budget_bytes = max(
                     0, total_vram - max_reserved - runtime_headroom
                 )

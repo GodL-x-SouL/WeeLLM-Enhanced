@@ -180,6 +180,24 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
         except Exception:
             pass
 
+    def _offload_visual_after_forward(self) -> None:
+        """Release the edit image encoder once its features have been produced."""
+        if not hasattr(self.model, "model") or not hasattr(self.model.model, "visual"):
+            return
+
+        visual = self.model.model.visual
+        hook_handle = None
+
+        def release_after_forward(module, args, output):
+            nonlocal hook_handle
+            if hook_handle is not None:
+                hook_handle.remove()
+            evict_module(module)
+            clean_memory(self.device)
+            return output
+
+        hook_handle = visual.register_forward_hook(release_after_forward)
+
     def _pre_hook(self, module: nn.Module, args):
         shard_name: str = module._qwen_te_shard
         pos = self._shard_name_to_pos[shard_name]
@@ -505,4 +523,6 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
             prefetch=prefetch,
             max_length=max_length,
         )
+        if is_edit_model:
+            instance._offload_visual_after_forward()
         return instance
