@@ -381,11 +381,14 @@ class WeeBasePipeline:
             pass
 
 
-        # If still not found, fallback to our custom pipelines directory
+        # If still not found, scan image/adapters/ for model-specific pipeline implementations.
+        # Uses rglob so any nested subfolder (e.g. adapters/) is also covered automatically.
         if pipeline_cls is None:
-            pipelines_dir = Path(__file__).parent / "pipelines" / "image"
+            pipelines_dir = Path(__file__).parent / "image"
             if pipelines_dir.exists():
-                for py_file in pipelines_dir.glob("*.py"):
+                for py_file in pipelines_dir.rglob("*.py"):
+                    if py_file.name == "__init__.py":
+                        continue
                     try:
                         import importlib.util
                         spec = importlib.util.spec_from_file_location("custom_pipeline", py_file)
@@ -393,7 +396,7 @@ class WeeBasePipeline:
                         spec.loader.exec_module(custom_module)
                         if hasattr(custom_module, pipeline_class_name):
                             pipeline_cls = getattr(custom_module, pipeline_class_name)
-                            logger.info(f"Loaded custom pipeline {pipeline_class_name} from {py_file.name}")
+                            logger.info(f"Loaded adapter pipeline {pipeline_class_name} from {py_file.relative_to(pipelines_dir)}")
                             break
                     except Exception as e:
                         pass
