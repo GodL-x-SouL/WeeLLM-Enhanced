@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 from weellm.io.ggufs.keymaps.t5     import T5KeyMap
 from weellm.io.ggufs.keymaps.llama  import LlamaKeyMap
 from weellm.io.ggufs.keymaps.flux   import FluxKeyMap
+from weellm.io.ggufs.keymaps.flux2  import Flux2KeyMap
 from weellm.io.ggufs.keymaps.sd3    import SD3KeyMap
 from weellm.io.ggufs.keymaps.sdxl   import SDXLKeyMap
 from weellm.io.ggufs.keymaps.sd15   import SD15KeyMap
@@ -33,6 +34,7 @@ logger = logging.getLogger("weellm")
 _REGISTRY = [
     T5KeyMap,       # enc.blk.*  — must come before llama (no overlap, but explicit ordering)
     LlamaKeyMap,    # blk.*
+    Flux2KeyMap,    # Flux.2 Klein: 8 double + 24 single blocks
     FluxKeyMap,     # double_blocks.*
     SD3KeyMap,      # joint_blocks.*
     SDXLKeyMap,     # model.diffusion_model.* + label_emb / transformer_blocks.9
@@ -76,6 +78,7 @@ __all__ = [
     "T5KeyMap",
     "LlamaKeyMap",
     "FluxKeyMap",
+    "Flux2KeyMap",
     "SD3KeyMap",
     "SDXLKeyMap",
     "SD15KeyMap",
