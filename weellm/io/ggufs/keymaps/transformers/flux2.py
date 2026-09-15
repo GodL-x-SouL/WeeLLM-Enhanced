@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List
 
-from weellm.io.ggufs.keymaps.flux import FluxKeyMap
+from weellm.io.ggufs.keymaps.transformers.flux import FluxKeyMap
 
 
 class Flux2KeyMap(FluxKeyMap):

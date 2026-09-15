@@ -16,18 +16,18 @@ more-general ones to avoid false matches.
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from weellm.io.ggufs.keymaps.t5     import T5KeyMap
-from weellm.io.ggufs.keymaps.llama  import LlamaKeyMap
-from weellm.io.ggufs.keymaps.flux   import FluxKeyMap
-from weellm.io.ggufs.keymaps.flux2  import Flux2KeyMap
-from weellm.io.ggufs.keymaps.glm    import GLMKeyMap
-from weellm.io.ggufs.keymaps.sd3    import SD3KeyMap
-from weellm.io.ggufs.keymaps.sdxl   import SDXLKeyMap
-from weellm.io.ggufs.keymaps.sd15   import SD15KeyMap
-from weellm.io.ggufs.keymaps.krea2  import Krea2KeyMap
-from weellm.io.ggufs.keymaps.zimage import ZImageKeyMap
-from weellm.io.ggufs.keymaps.minimax_h3 import MiniMaxH3KeyMap
-from weellm.io.ggufs.keymaps.qwen3vl import Qwen3VLKeyMap
+from weellm.io.ggufs.keymaps.text_encoders.t5     import T5KeyMap
+from weellm.io.ggufs.keymaps.text_encoders.llama  import LlamaKeyMap
+from weellm.io.ggufs.keymaps.transformers.flux   import FluxKeyMap
+from weellm.io.ggufs.keymaps.transformers.flux2  import Flux2KeyMap
+from weellm.io.ggufs.keymaps.text_encoders.glm    import GLMKeyMap
+from weellm.io.ggufs.keymaps.transformers.sd3    import SD3KeyMap
+from weellm.io.ggufs.keymaps.transformers.sdxl   import SDXLKeyMap
+from weellm.io.ggufs.keymaps.transformers.sd15   import SD15KeyMap
+from weellm.io.ggufs.keymaps.transformers.krea2  import Krea2KeyMap
+from weellm.io.ggufs.keymaps.transformers.zimage import ZImageKeyMap
+from weellm.io.ggufs.keymaps.transformers.minimax_h3 import MiniMaxH3KeyMap
+from weellm.io.ggufs.keymaps.text_encoders.qwen3vl import Qwen3VLKeyMap
 
 logger = logging.getLogger("weellm")
 
