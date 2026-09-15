@@ -10,28 +10,25 @@ class Flux2KeyMap(FluxKeyMap):
 
     @staticmethod
     def detect(gguf_keys: List[str], arch: str) -> bool:
-        double_blocks = {
-            int(parts[1])
+        has_klein_modulation = {
+            "double_stream_modulation_img.lin.weight",
+            "double_stream_modulation_txt.lin.weight",
+            "single_stream_modulation.lin.weight",
+        }.issubset(gguf_keys)
+        has_flux2_inputs = {
+            "img_in.weight",
+            "txt_in.weight",
+            "time_in.in_layer.weight",
+            "time_in.out_layer.weight",
+        }.issubset(gguf_keys)
+        has_flux1_only_inputs = any(
+            key.startswith(("guidance_in.", "vector_in."))
             for key in gguf_keys
-            if (parts := key.split("."))[:1] == ["double_blocks"]
-            and len(parts) > 1
-            and parts[1].isdigit()
-        }
-        single_blocks = {
-            int(parts[1])
-            for key in gguf_keys
-            if (parts := key.split("."))[:1] == ["single_blocks"]
-            and len(parts) > 1
-            and parts[1].isdigit()
-        }
-        return (
-            arch in ("flux2", "flux2-klein")
-            or (
-                double_blocks == set(range(8))
-                and single_blocks == set(range(24))
-                and "time_in.in_layer.weight" in gguf_keys
-                and "double_stream_modulation_img.lin.weight" in gguf_keys
-            )
+        )
+        return arch in ("flux2", "flux2-klein") or (
+            has_klein_modulation
+            and has_flux2_inputs
+            and not has_flux1_only_inputs
         )
 
     @staticmethod
