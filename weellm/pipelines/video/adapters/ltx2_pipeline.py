@@ -19,7 +19,12 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         from pathlib import Path
         import json
         import torch
+        from diffusers import LTX2Pipeline
         from weellm.pipelines.weebasepipeline import WeeBasePipeline
+
+        # Force skip downloading/loading the unneeded massive components by injecting a dummy _path.
+        # This tells WeeBasePipeline that we are overriding them, so it removes them from HF downloads.
+        kwargs.setdefault("prompt_enhancer_path", "DUMMY_SKIP_DOWNLOAD")
         
         model_dir_path = Path(model_dir)
         device = kwargs.get("device", "cuda")

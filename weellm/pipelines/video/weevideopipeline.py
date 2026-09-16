@@ -109,6 +109,14 @@ class WeeVideoPipeline(WeeBasePipeline):
     def from_pretrained(cls, model_dir: str, **kwargs):
         index_path = os.path.join(model_dir, "model_index.json")
         class_name = ""
+        
+        if not os.path.exists(index_path):
+            try:
+                from huggingface_hub import hf_hub_download
+                index_path = hf_hub_download(model_dir, "model_index.json")
+            except Exception:
+                pass
+                
         if os.path.exists(index_path):
             with open(index_path, "r", encoding="utf-8") as f:
                 class_name = json.load(f).get("_class_name", "")

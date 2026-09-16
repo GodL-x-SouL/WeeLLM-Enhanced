@@ -443,6 +443,9 @@ class WeeBasePipeline:
         if pipeline_cls is None:
             raise ImportError(f"Could not find pipeline class {pipeline_class_name} in diffusers, local custom files, or external_pipelines.")
             
+        # Clean up any remaining _path kwargs so they don't crash Diffusers __init__
+        diffusers_kwargs = {k: v for k, v in diffusers_kwargs.items() if not k.endswith("_path")}
+            
         pipeline = pipeline_cls(**diffusers_kwargs)
         if hasattr(pipeline, "register_components"):
             # Modular pipelines ignore kwargs in __init__, so we must register them explicitly
