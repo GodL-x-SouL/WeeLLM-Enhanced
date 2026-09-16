@@ -22,6 +22,8 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         from weellm.pipelines.weebasepipeline import WeeBasePipeline
         
         model_dir_path = Path(model_dir)
+        device = kwargs.get("device", "cuda")
+        dtype  = kwargs.get("torch_dtype", torch.bfloat16)
         
         # 1. Inject Dummy Components for LTX specific missing parts to satisfy diffusers __init__
         class DummyComponent:
@@ -40,23 +42,17 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
             if "vocoder" in index and "vocoder" not in kwargs:
                 try:
                     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
-                    device = kwargs.get("device", "cuda")
-                    dtype = kwargs.get("torch_dtype", torch.bfloat16)
                     vocoder = LTX2VocoderWithBWE.from_pretrained(
                         model_dir_path / "vocoder", torch_dtype=dtype
                     ).to(device)
                     kwargs["vocoder"] = vocoder
                 except Exception as e:
-                    logger.warning("Failed to load vocoder: %s", e)
-                    kwargs.setdefault("vocoder", DummyComponent())
-            else:
-                kwargs.setdefault("vocoder", DummyComponent())
+                    logger.error("Failed to load vocoder: %s", e)
+                    raise e
             
             if "connectors" in index and "connectors" not in kwargs:
                 try:
                     from weellm.models.transformers.ltx2_connectors import LTX2ConnectorsStreamer
-                    device = kwargs.get("device", "cuda")
-                    dtype = kwargs.get("torch_dtype", torch.bfloat16)
                     cache_to_ram = kwargs.get("cache_to_ram", False)
                     
                     conn = LTX2ConnectorsStreamer.from_pretrained(
@@ -72,8 +68,6 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
             if "audio_vae" in index and "audio_vae" not in kwargs:
                 try:
                     from diffusers.models.autoencoders.autoencoder_kl_ltx2_audio import AutoencoderKLLTX2Audio
-                    device = kwargs.get("device", "cuda")
-                    dtype = kwargs.get("torch_dtype", torch.bfloat16)
                     audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
                         model_dir_path / "audio_vae", torch_dtype=dtype
                     ).to(device)
@@ -92,6 +86,29 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 "Note: This processes all frames at once and requires significantly more memory, "
                 "which may trigger system RAM swap on low-VRAM machines."
             )
+        if hasattr(pipe._pipeline, "enable_vae_tiling"):
+            pipe._pipeline.enable_vae_tiling()
+            
+        # Gemma 3/4 uses left-padding for prompts. Because it is a causal model, 
+        # the padded tokens at the beginning of the sequence have nothing to attend to 
+        # (their entire attention row is masked out). When PyTorch calculates Softmax 
+        # on an entirely masked row (all -inf), it outputs NaN.
+        # These NaNs ONLY exist on the padded tokens. The real tokens are perfectly healthy.
+        # The downstream LTX transformer ignores these padded tokens anyway, but the NaNs 
+        # trip up the WeeLLM cache corruption check. We simply zero them out.
+        _orig_encode = pipe.encode_prompt
+        def _safe_encode(*args, **kwargs):
+            out = _orig_encode(*args, **kwargs)
+            # out is (prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask)
+            clean_out = []
+            for item in out:
+                if isinstance(item, torch.Tensor) and torch.is_floating_point(item):
+                    clean_out.append(torch.nan_to_num(item, nan=0.0, posinf=0.0, neginf=0.0))
+                else:
+                    clean_out.append(item)
+            return tuple(clean_out)
+                    
+        pipe.encode_prompt = _safe_encode
             
         return pipe
 
@@ -117,8 +134,8 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
             
         kwargs["num_frames"] = _resolved_num_frames
         
-        # 2. Inject Dummy Components for LTX specific missing audio parts
-        _CALLABLE_COMPONENT_NAMES = ("vocoder", "duration_head", "prompt_enhancer")
+        # 2. Inject Dummy Components for LTX specific missing parts
+        _CALLABLE_COMPONENT_NAMES = ("duration_head", "prompt_enhancer")
         for _comp_name in _CALLABLE_COMPONENT_NAMES:
             if getattr(self._pipeline, _comp_name, None) is None:
                 class DummyComponent:

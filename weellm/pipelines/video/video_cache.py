@@ -160,7 +160,19 @@ class VideoStepCache:
         """
         Persist the prompt-embeds dict to disk.
         Tensors are moved to CPU before saving.
+
+        Raises ``ValueError`` if any tensor in *data* contains NaN or Inf values so
+        that corrupt text-encoder outputs are never silently cached and reused on
+        subsequent runs (which would produce a black video with no obvious error).
         """
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                if torch.isnan(val).any() or torch.isinf(val).any():
+                    raise ValueError(
+                        f"[VideoCache] Text encoder output '{key}' contains NaN/Inf values. "
+                        "Refusing to cache corrupt embeddings. "
+                        "Check your text encoder for numerical instability (e.g. dtype overflow)."
+                    )
         cpu_data = {
             k: (v.cpu() if isinstance(v, torch.Tensor) else v)
             for k, v in data.items()
