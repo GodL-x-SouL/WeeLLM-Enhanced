@@ -29,10 +29,45 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         self.layer_count = len(model.layers)
         self._shard_order = [f"{self.shard_prefix}.{i}" for i in range(self.layer_count)]
         
-        self._executor = ThreadPoolExecutor(max_workers=1) if prefetch else None
-        self._next_future = None
-        self._next_future_name = None
+        self._prefetch_depth = 0
+        if self.prefetch:
+            try:
+                import psutil
+                _RAM_SAFETY_BYTES = 2 * 1024 * 1024 * 1024
+                _MAX_PREFETCH_DEPTH = 6
+                sample_keys = [k for k in self.seeker.weight_map if k.startswith(self._shard_order[0] + ".")]
+                layer_bytes = self.seeker.get_block_bytes(sample_keys)
+                available = psutil.virtual_memory().available
+                usable = max(0, available - _RAM_SAFETY_BYTES)
+                
+                if usable <= 0:
+                    logger.warning("[TE Streamer] Available RAM (%.1f GB) below safety threshold. Disabling TE prefetch.", available / 1e9)
+                    self._prefetch_depth = 0
+                else:
+                    self._prefetch_depth = max(1, min(_MAX_PREFETCH_DEPTH, int(usable // layer_bytes)))
+                    logger.info(
+                        "[TE Streamer] Adaptive prefetch depth: %d (layer=%.0f MB, usable RAM=%.1f GB)",
+                        self._prefetch_depth, layer_bytes / 1e6, usable / 1e9,
+                    )
+            except Exception as e:
+                self._prefetch_depth = 1
+                logger.debug("[TE Streamer] Failed to calculate adaptive prefetch depth, defaulting to 1.")
+
+        if self._prefetch_depth > 0:
+            self._executor = ThreadPoolExecutor(max_workers=self._prefetch_depth)
+        else:
+            self._executor = None
+            
+        self._prefetch_futures = {}
         self._lock = threading.Lock()
+        
+        if self._executor is not None:
+            for i in range(min(self._prefetch_depth, self.layer_count)):
+                shard_name = self._shard_order[i]
+                layer_keys = [k for k in self.seeker.weight_map if k.startswith(shard_name + ".")]
+                self._prefetch_futures[shard_name] = self._executor.submit(
+                    self.seeker.get_tensors, layer_keys, "cpu", self.dtype
+                )
         
         self._install_hooks()
 
@@ -54,17 +89,23 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         import time
         t0 = time.time()
         shard_name = module._gemma_te_shard
+        pos = int(shard_name.split(".")[-1])
         layer_keys = [k for k in self.seeker.weight_map if k.startswith(shard_name + ".")]
         
+        fut = None
         with self._lock:
-            if self.prefetch and self._next_future_name == shard_name and self._next_future is not None:
-                sd = self._next_future.result()
-                self._next_future = None
-                self._next_future_name = None
-            else:
-                sd = self.seeker.get_tensors(layer_keys, device=self.device, dtype=self.dtype)
+            fut = self._prefetch_futures.pop(shard_name, None)
+            
+        if fut is not None:
+            sd = fut.result()
+        else:
+            sd = self.seeker.get_tensors(layer_keys, device="cpu", dtype=self.dtype)
                 
         t1 = time.time()
+        
+        sd = {k: v.to(self.device, non_blocking=True) for k, v in sd.items()}
+        torch.cuda.synchronize()
+        
         mapped_sd = {}
         for k, v in sd.items():
             if k.startswith("model.language_model."):
@@ -80,24 +121,27 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
             except Exception as e:
                 if "layer_scalar" not in mapped_k:
                     logger.error(f"FAILED TO PLACE {mapped_k}: {repr(e)}")
+        
+        torch.cuda.synchronize()
+        del sd
                     
         t2 = time.time()
-        pos = int(shard_name.split(".")[-1])
         logger.info(
             "    [TE Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs",
             shard_name, pos + 1, self.layer_count, t1 - t0, t2 - t1,
         )
         module._weellm_t_compute_start = time.time()
         
-        next_pos = pos + 1
-        if self.prefetch and self._executor is not None and next_pos < self.layer_count:
-            next_name = self._shard_order[next_pos]
-            next_keys = [k for k in self.seeker.weight_map if k.startswith(next_name + ".")]
-            with self._lock:
-                self._next_future = self._executor.submit(
-                    self.seeker.get_tensors, next_keys, self.device, self.dtype
-                )
-                self._next_future_name = next_name
+        if self._executor is not None:
+            next_pos = pos + self._prefetch_depth
+            if next_pos < self.layer_count:
+                next_name = self._shard_order[next_pos]
+                next_keys = [k for k in self.seeker.weight_map if k.startswith(next_name + ".")]
+                with self._lock:
+                    if next_name not in self._prefetch_futures:
+                        self._prefetch_futures[next_name] = self._executor.submit(
+                            self.seeker.get_tensors, next_keys, "cpu", self.dtype
+                        )
 
     def _post_hook(self, module, args, output):
         import time
