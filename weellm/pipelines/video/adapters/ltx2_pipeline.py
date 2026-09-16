@@ -148,6 +148,7 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         if _image is not None or _video is not None:
             _current_class_name = self._pipeline.__class__.__name__
             _model_dir = getattr(self._pipeline, "model_dir", None)
+            _safe_encode = getattr(self._pipeline, "encode_prompt", None)
             
             if _video is not None:
                 if "InContext" not in _current_class_name:
@@ -163,6 +164,9 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                     self._pipeline = LTX2ImageToVideoPipeline(**self._pipeline.components)
                     if _model_dir:
                         self._pipeline.model_dir = _model_dir
+                        
+            if _safe_encode is not None:
+                self._pipeline.encode_prompt = _safe_encode
 
         # 1. Handle LTX-specific 8k+1 frame snapping
         _resolved_num_frames = kwargs.pop("num_frames", None)
