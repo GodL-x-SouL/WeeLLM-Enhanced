@@ -28,6 +28,7 @@ from weellm.io.ggufs.keymaps.transformers.krea2  import Krea2KeyMap
 from weellm.io.ggufs.keymaps.transformers.zimage import ZImageKeyMap
 from weellm.io.ggufs.keymaps.transformers.minimax_h3 import MiniMaxH3KeyMap
 from weellm.io.ggufs.keymaps.text_encoders.qwen3vl import Qwen3VLKeyMap
+from weellm.io.ggufs.keymaps.transformers.ltx25 import LTX25KeyMap
 
 logger = logging.getLogger("weellm")
 
@@ -45,6 +46,7 @@ _REGISTRY = [
     ZImageKeyMap,   # context_refiner.* / noise_refiner.*
     Qwen3VLKeyMap,  # visual.blocks.* + model.layers.* (unsloth Qwen3VL TE GGUF)
     MiniMaxH3KeyMap,# blocks.* (MiniMax H3 checkpoint convention)
+    LTX25KeyMap,     # ltxv native keys
 ]
 
 
@@ -89,4 +91,5 @@ __all__ = [
     "ZImageKeyMap",
     "Qwen3VLKeyMap",
     "MiniMaxH3KeyMap",
+    "LTX25KeyMap",
 ]
