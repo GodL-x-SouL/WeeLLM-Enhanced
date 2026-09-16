@@ -369,6 +369,7 @@ class WeeBasePipeline:
             model_dir_path,
             index,
             device,
+            torch_dtype,
             effective_dtype,
             cache_to_ram,
             diffusers_kwargs,
