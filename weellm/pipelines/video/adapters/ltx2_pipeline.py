@@ -75,7 +75,24 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 except Exception as e:
                     logger.warning("Failed to load audio_vae: %s", e)
                     
+        _temporal = kwargs.pop("temporal_upscaler", None)
+        if "temporal_upscaler" in index and _temporal is None:
+            try:
+                from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+                _temporal = LTX2LatentUpsamplerModel.from_pretrained(
+                    model_dir_path / "temporal_upscaler", torch_dtype=dtype
+                ).to(device)
+            except Exception as e:
+                logger.warning("Failed to load temporal_upscaler: %s", e)
+                
         pipe = super().from_pretrained(model_dir, **kwargs)
+        
+        if _temporal is not None:
+            if isinstance(_temporal, str):
+                from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+                _temporal = LTX2LatentUpsamplerModel.from_pretrained(_temporal, torch_dtype=dtype).to(device)
+            # Attach to the underlying diffusers pipeline so kwargs.get('temporal_upscaler') is not needed
+            setattr(pipe._pipeline, "temporal_upscaler", _temporal)
         
         # Override the base pipeline's default VAE chunking because LTX-2.5 is sensitive to it
         if hasattr(pipe._pipeline.vae, "use_framewise_decoding"):
@@ -113,6 +130,29 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         return pipe
 
     def __call__(self, prompt: str, **kwargs):
+        # 0. Handle Pipeline Routing for Image/Video modalities
+        _image = kwargs.get("image")
+        _video = kwargs.get("video")
+        
+        if _image is not None or _video is not None:
+            _current_class_name = self._pipeline.__class__.__name__
+            _model_dir = getattr(self._pipeline, "model_dir", None)
+            
+            if _video is not None:
+                if "InContext" not in _current_class_name:
+                    from diffusers import LTX2InContextPipeline
+                    logger.info("Routing to LTX2InContextPipeline (Video-to-Video)...")
+                    self._pipeline = LTX2InContextPipeline(**self._pipeline.components)
+                    if _model_dir:
+                        self._pipeline.model_dir = _model_dir
+            elif _image is not None:
+                if "ImageToVideo" not in _current_class_name:
+                    from diffusers import LTX2ImageToVideoPipeline
+                    logger.info("Routing to LTX2ImageToVideoPipeline...")
+                    self._pipeline = LTX2ImageToVideoPipeline(**self._pipeline.components)
+                    if _model_dir:
+                        self._pipeline.model_dir = _model_dir
+
         # 1. Handle LTX-specific 8k+1 frame snapping
         _resolved_num_frames = kwargs.pop("num_frames", None)
         _duration = kwargs.pop("duration", None)
@@ -154,8 +194,27 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         """
         LTX-2.5 specific latent preprocessing.
         LTX latents are pre-scaled, so we skip standard scaling/shifting.
-        We also handle the optional latent upsampler here.
+        We also handle the optional latent upsampler and temporal upscaler here.
         """
+        temporal_upscaler = kwargs.get("temporal_upscaler", getattr(self._pipeline, "temporal_upscaler", None))
+        if temporal_upscaler:
+            logger.info("Upsampling latents temporally using %s", temporal_upscaler)
+            
+            _dev = latents.device
+            _dtype = vae.dtype if vae else latents.dtype
+            
+            _ups_model = temporal_upscaler
+            if isinstance(_ups_model, str):
+                from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+                _ups_model = LTX2LatentUpsamplerModel.from_pretrained(_ups_model).to(device=_dev, dtype=_dtype)
+            
+            _ups_model = _ups_model.to(device=_dev, dtype=_dtype)
+            with torch.no_grad():
+                latents = _ups_model(latents)
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
         latent_upsampler = kwargs.get("latent_upsampler", None)
         if latent_upsampler:
             logger.info("Upsampling latents using %s", latent_upsampler)
@@ -172,3 +231,17 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 torch.cuda.empty_cache()
                 
         return latents
+
+    def load_lora_weights(self, pretrained_model_name_or_path_or_dict, **kwargs):
+        """Intercept diffusers LoRA loading to preserve WeeLLM LiveSeeker hooks."""
+        from weellm.models.loras.lora_streamer import GenericLazyLoRALoader
+        logger.info(f"[WeeLLM] Intercepted load_lora_weights for {pretrained_model_name_or_path_or_dict}")
+        
+        lazy_loader = GenericLazyLoRALoader(pretrained_model_name_or_path_or_dict)
+        _tr_model = getattr(self._pipeline, "transformer", None)
+        if _tr_model is not None:
+            lazy_loader.apply_to_module(_tr_model, "transformer")
+            
+        _conn_model = getattr(self._pipeline, "connectors", None)
+        if _conn_model is not None:
+            lazy_loader.apply_to_module(_conn_model, "connectors")
