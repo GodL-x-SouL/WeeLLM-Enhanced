@@ -366,7 +366,14 @@ class WeeBasePipeline:
         # ── Step 3: Text Encoders ────────────────────────────────────────
         logger.info("\n[3/4] Preparing Text Encoders ...")
         te_streamers = cls._load_text_encoders(
-            model_dir_path, index, device, effective_dtype, effective_dtype, cache_to_ram, diffusers_kwargs, pipeline_class_name
+            model_dir_path,
+            index,
+            device,
+            effective_dtype,
+            cache_to_ram,
+            diffusers_kwargs,
+            pipeline_class_name,
+            is_edit_model=getattr(cls, "_is_edit_model", False),
         )
 
         # ── Step 4: Transformer / UNet ──────────────────────────────────
@@ -601,6 +608,7 @@ class WeeBasePipeline:
         cache_to_ram: bool,
         out: dict,
         pipeline_class_name: str,
+        is_edit_model: bool = False,
     ) -> dict:
         """Load all text encoders, inject streamers, return streamer references for later eviction."""
         te_streamers = {}
@@ -673,7 +681,10 @@ class WeeBasePipeline:
                             "cache_to_ram": cache_to_ram,
                         }
                         if "Qwen2_5_VL" in hf_cls_name:
-                            is_edit = any(kw in pipeline_class_name for kw in ["Edit", "Img2Img", "Image2Image", "Inpaint"]) or getattr(cls, "_is_edit_model", False)
+                            is_edit = is_edit_model or any(
+                                kw in pipeline_class_name
+                                for kw in ["Edit", "Img2Img", "Image2Image", "Inpaint"]
+                            )
                             te_kwargs["is_edit_model"] = is_edit
                         streamer = te_cls.from_pretrained(**te_kwargs)
                         if hasattr(streamer, "_ensure_initialized"):
