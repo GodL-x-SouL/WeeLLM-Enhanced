@@ -26,6 +26,12 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         # This tells WeeBasePipeline that we are overriding them, so it removes them from HF downloads.
         kwargs.setdefault("prompt_enhancer_path", "DUMMY_SKIP_DOWNLOAD")
         
+        # If model_dir is a Hugging Face Repo ID, resolve it to a local path now
+        # so that our manual vocoder/connectors loading can find the local files.
+        from weellm.io.utils import resolve_model_path
+        skip_components = {k[:-5] for k, v in kwargs.items() if k.endswith("_path") and v is not None}
+        model_dir = str(resolve_model_path(str(model_dir), skip_components=skip_components or None))
+        
         model_dir_path = Path(model_dir)
         device = kwargs.get("device", "cuda")
         dtype  = kwargs.get("torch_dtype", torch.bfloat16)
