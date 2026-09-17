@@ -20,10 +20,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
-from weellm.utils import clean_memory, report_memory
-from weellm.memory import place_tensors, evict_module
-from weellm.seeker import get_seeker
+from weellm.io.utils import default_dtype
+from weellm.io.utils import clean_memory, report_memory
+from weellm.io.memory import place_tensors, evict_module
+from weellm.io.seeker import get_seeker
 from accelerate.utils.modeling import set_module_tensor_to_device
 
 
@@ -49,7 +49,7 @@ def _get_resident_keys(seeker, is_edit_model: bool = False) -> List[str]:
             continue
         if k.startswith("lm_head."):
             continue
-        if k.startswith("visual."):
+        if not is_edit_model and (k.startswith("visual.") or k.startswith("model.visual.")):
             continue
         keys.append(k)
     return keys
@@ -59,6 +59,8 @@ def map_qwen_key(k: str) -> str:
     """Map safetensors keys to Qwen2_5_VLForConditionalGeneration module names."""
     if k.startswith("visual."):
         return "model." + k
+    elif k.startswith("model.visual."):
+        return k
     elif k.startswith("model."):
         return k.replace("model.", "model.language_model.", 1)
     return k
@@ -179,6 +181,24 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
             self.model.forward = types.MethodType(patched_qwen_forward, self.model)
         except Exception:
             pass
+
+    def _offload_visual_after_forward(self) -> None:
+        """Release the edit image encoder once its features have been produced."""
+        if not hasattr(self.model, "model") or not hasattr(self.model.model, "visual"):
+            return
+
+        visual = self.model.model.visual
+        hook_handle = None
+
+        def release_after_forward(module, args, output):
+            nonlocal hook_handle
+            if hook_handle is not None:
+                hook_handle.remove()
+            evict_module(module)
+            clean_memory(self.device)
+            return output
+
+        hook_handle = visual.register_forward_hook(release_after_forward)
 
     def _pre_hook(self, module: nn.Module, args):
         shard_name: str = module._qwen_te_shard
@@ -329,7 +349,7 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
         
         if cpu_sd:
             place_tensors(model, cpu_sd, "cpu", dtype)
-            from weellm.memory import pin_module_to_cpu
+            from weellm.io.memory import pin_module_to_cpu
             pin_module_to_cpu(model, "model.language_model.embed_tokens")
             
         if gpu_sd:
@@ -505,4 +525,6 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
             prefetch=prefetch,
             max_length=max_length,
         )
+        if is_edit_model:
+            instance._offload_visual_after_forward()
         return instance

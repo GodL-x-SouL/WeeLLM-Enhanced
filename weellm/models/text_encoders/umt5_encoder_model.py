@@ -22,10 +22,10 @@ import torch
 import torch.nn as nn
 
 from accelerate import init_empty_weights
-from weellm.utils import default_dtype
-from weellm.seeker import get_seeker
-from weellm.utils import clean_memory, report_memory
-from weellm.memory import place_tensors, evict_module
+from weellm.io.utils import default_dtype
+from weellm.io.seeker import get_seeker
+from weellm.io.utils import clean_memory, report_memory
+from weellm.io.memory import place_tensors, evict_module
 from accelerate.utils.modeling import set_module_tensor_to_device
 
 
@@ -129,7 +129,7 @@ class UMT5EncoderModelStreamer:
         
         if cpu_sd:
             place_tensors(model, cpu_sd, "cpu", dtype)
-            from weellm.memory import pin_module_to_cpu
+            from weellm.io.memory import pin_module_to_cpu
             pin_module_to_cpu(model, "shared")
             if hasattr(model.encoder, "embed_tokens"):
                 pin_module_to_cpu(model, "encoder.embed_tokens")

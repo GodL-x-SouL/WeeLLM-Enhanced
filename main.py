@@ -217,7 +217,7 @@ def main() -> int:
             class_name = json.load(f).get("_class_name", "")
             
     VIDEO_CLASSES = [
-        "LTXVideoPipeline", "MiniMaxH3ModularPipeline", "WanPipeline", "CogVideoXPipeline"
+        "LTX2Pipeline", "MiniMaxH3ModularPipeline", "WanPipeline", "CogVideoXPipeline"
     ]
     is_video = class_name in VIDEO_CLASSES
 
@@ -269,7 +269,7 @@ def main() -> int:
     logger.info("  Prompt:   %s", args.prompt)
     if args.negative_prompt:
         logger.info("  Neg:      %s", args.negative_prompt)
-    logger.info("  Size:     %d x %d px", args.width, args.height)
+    logger.info("  Size:     %s x %s px", args.width, args.height)
     logger.info(
         "  Steps:    %d  |  Guidance: %s  |  Seed: %s",
         args.steps, args.guidance_scale, args.seed,
