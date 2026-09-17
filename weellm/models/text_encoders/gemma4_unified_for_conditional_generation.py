@@ -179,9 +179,8 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         config = Gemma3Config.from_dict(cfg_dict)
         text_config = config.text_config
         
-        # Crucial fix: The original Gemma 3 config has vocab_size 262208, 
-        # but the LTX-2.5 safetensors checkpoint has exactly 262144 embeddings.
-        text_config.vocab_size = 262144
+        # Use the config vocab size exactly as provided in the config.json
+        # text_config.vocab_size = 262144
         
         with init_empty_weights():
             model = Gemma3TextModel(text_config)
@@ -270,9 +269,9 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
                 
         for mapped_k, mapped_v in mapped_sd.items():
             try:
-                place_tensors(model, {mapped_k: mapped_v}, device, dtype, skip_errors=True)
-            except Exception:
-                pass
+                place_tensors(model, {mapped_k: mapped_v}, device, dtype, skip_errors=False)
+            except Exception as e:
+                logger.error(f"[TE Streamer] Failed to place resident tensor {mapped_k}: {repr(e)}")
         del sd
         
         return streamer
