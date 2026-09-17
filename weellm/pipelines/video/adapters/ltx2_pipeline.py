@@ -129,15 +129,27 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
             out = _orig_encode(*args, **kwargs)
             # out is (prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask)
             clean_out = []
+            _target_dtype = getattr(pipe._pipeline, "dtype", dtype)
             for item in out:
                 if isinstance(item, torch.Tensor) and torch.is_floating_point(item):
-                    clean_out.append(torch.nan_to_num(item, nan=0.0, posinf=0.0, neginf=0.0))
+                    clean_item = torch.nan_to_num(item, nan=0.0, posinf=0.0, neginf=0.0)
+                    clean_out.append(clean_item.to(_target_dtype))
                 else:
                     clean_out.append(item)
             return tuple(clean_out)
                     
         pipe.encode_prompt = _safe_encode
-            
+        
+        # 4. Automatically handle Data Type casting for Connectors (Handles Cache Hits)
+        if hasattr(pipe._pipeline, "connectors"):
+            _orig_conn_forward = pipe._pipeline.connectors.forward
+            def _safe_conn_forward(*args, **kwargs):
+                _target_dtype = getattr(pipe._pipeline, "dtype", dtype)
+                new_args = tuple(a.to(_target_dtype) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args)
+                new_kwargs = {k: (v.to(_target_dtype) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for k, v in kwargs.items()}
+                return _orig_conn_forward(*new_args, **new_kwargs)
+            pipe._pipeline.connectors.forward = _safe_conn_forward
+
         return pipe
 
     def __call__(self, prompt: str, **kwargs):
