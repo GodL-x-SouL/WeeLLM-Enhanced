@@ -154,31 +154,73 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
 
     def __call__(self, prompt: str, **kwargs):
         # 0. Handle Pipeline Routing for Image/Video modalities
-        _image = kwargs.get("image")
-        _video = kwargs.get("video")
+        _first_frame = kwargs.pop("first_frame", None)
+        _last_frame = kwargs.pop("last_frame", None)
+        # For backwards compatibility with standard Diffusers 'image'
+        _image_fallback = kwargs.pop("image", None)
+        if _first_frame is None and _image_fallback is not None:
+            _first_frame = _image_fallback
         
-        if _image is not None or _video is not None:
+        # Remove video kwarg if it somehow gets passed to prevent crashes
+        kwargs.pop("video", None)
+
+        if _first_frame is not None:
             _current_class_name = self._pipeline.__class__.__name__
             _model_dir = getattr(self._pipeline, "model_dir", None)
             _safe_encode = getattr(self._pipeline, "encode_prompt", None)
             
-            if _video is not None:
+            if _last_frame is not None:
+                # Both frames provided: Route to InContext Pipeline (Interpolation)
                 if "InContext" not in _current_class_name:
                     from diffusers import LTX2InContextPipeline
-                    logger.info("Routing to LTX2InContextPipeline (Video-to-Video)...")
-                    self._pipeline = LTX2InContextPipeline(**self._pipeline.components)
+                    from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
+                    import inspect
+                    logger.info("Routing to LTX2InContextPipeline (Video Interpolation)...")
+                    valid_keys = set(inspect.signature(LTX2InContextPipeline.__init__).parameters.keys())
+                    safe_components = {k: v for k, v in self._pipeline.components.items() if k in valid_keys}
+                    self._pipeline = LTX2InContextPipeline(**safe_components)
                     if _model_dir:
                         self._pipeline.model_dir = _model_dir
-            elif _image is not None:
+                
+                # Build the condition objects for the underlying pipeline
+                from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
+                kwargs["conditions"] = [
+                    LTX2VideoCondition(frames=_first_frame, index=0, strength=1.0),
+                    LTX2VideoCondition(frames=_last_frame, index=-1, strength=1.0)
+                ]
+                
+            else:
+                # Only first frame provided: Route to ImageToVideo Pipeline
                 if "ImageToVideo" not in _current_class_name:
                     from diffusers import LTX2ImageToVideoPipeline
-                    logger.info("Routing to LTX2ImageToVideoPipeline...")
-                    self._pipeline = LTX2ImageToVideoPipeline(**self._pipeline.components)
+                    import inspect
+                    logger.info("Routing to LTX2ImageToVideoPipeline (Image-to-Video)...")
+                    valid_keys = set(inspect.signature(LTX2ImageToVideoPipeline.__init__).parameters.keys())
+                    safe_components = {k: v for k, v in self._pipeline.components.items() if k in valid_keys}
+                    self._pipeline = LTX2ImageToVideoPipeline(**safe_components)
                     if _model_dir:
                         self._pipeline.model_dir = _model_dir
-                        
+                
+                kwargs["image"] = _first_frame
+                
             if _safe_encode is not None:
                 self._pipeline.encode_prompt = _safe_encode
+        else:
+            # Neither provided: Route back to TextToVideo if needed
+            _current_class_name = self._pipeline.__class__.__name__
+            if _current_class_name != "LTX2Pipeline":
+                from diffusers import LTX2Pipeline
+                import inspect
+                logger.info("Routing back to LTX2Pipeline (Text-to-Video)...")
+                _model_dir = getattr(self._pipeline, "model_dir", None)
+                _safe_encode = getattr(self._pipeline, "encode_prompt", None)
+                valid_keys = set(inspect.signature(LTX2Pipeline.__init__).parameters.keys())
+                safe_components = {k: v for k, v in self._pipeline.components.items() if k in valid_keys}
+                self._pipeline = LTX2Pipeline(**safe_components)
+                if _model_dir:
+                    self._pipeline.model_dir = _model_dir
+                if _safe_encode is not None:
+                    self._pipeline.encode_prompt = _safe_encode
 
         # 1. Handle LTX-specific 8k+1 frame snapping
         _resolved_num_frames = kwargs.pop("num_frames", None)
