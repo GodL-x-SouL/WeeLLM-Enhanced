@@ -12,6 +12,32 @@ from weellm.pipelines.video.weevideopipeline import WeeVideoPipeline
 
 logger = logging.getLogger("weellm")
 
+def maybe_disable_image_crf(pipeline, kwargs: dict) -> bool:
+    """Skip H.264 CRF re-compression of the start frame when PyAV is missing.
+
+    Newer diffusers re-compress image conditioning via PyAV
+    (``image_crf`` pipeline kwarg, resolved non-zero by default). Without the
+    ``av`` package generation dies AFTER all the heavy work. When ``av`` is
+    unavailable and the pipeline accepts ``image_crf``, force it to 0 (skip).
+    Returns True when the fallback engaged. Never raises.
+    """
+    try:
+        import av  # noqa: F401
+        return False
+    except ImportError:
+        pass
+    try:
+        import inspect
+        params = inspect.signature(pipeline.__call__).parameters
+        if "image_crf" in params and "image_crf" not in kwargs:
+            kwargs["image_crf"] = 0
+            logger.info("[WeeLLM] PyAV missing: image_crf=0 (skipping start-frame re-compression).")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 class WeeLTX2Pipeline(WeeVideoPipeline):
     
     @classmethod
@@ -257,6 +283,7 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
                 )
                 
         # 3. Delegate to the shared generic video generation loop in the base class
+        maybe_disable_image_crf(self._pipeline, kwargs)
         return super().__call__(prompt=prompt, **kwargs)
 
     def _preprocess_latents_for_decode(self, latents, vae, kwargs):

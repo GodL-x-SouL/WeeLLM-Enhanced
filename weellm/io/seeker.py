@@ -136,7 +136,7 @@ def get_seeker(model_dir: Union[str, Path], cache_to_ram: bool = False):
         if len(parts) >= 3 and "." in parts[-1]:
             repo_id = f"{parts[0]}/{parts[1]}"
             filename = "/".join(parts[2:])
-            logger.info("  [WeeLLM] Hub file '%s' not found locally. Downloading from repo: %s...", model_dir_str, repo_id)
+            logger.debug("  [WeeLLM] Hub file '%s' not found locally. Resolving from repo: %s...", model_dir_str, repo_id)
             from huggingface_hub import hf_hub_download
             downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
             model_dir_path = Path(downloaded_path)
