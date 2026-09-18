@@ -22,6 +22,10 @@ Unet streamers
 import logging
 
 __version__ = "0.1.0"
+# Bumped whenever Studio-facing engine interfaces change (new seeker kinds,
+# pipeline kwargs, streamer behavior). Studio Cell 2 requires a minimum and
+# fails fast with "re-run Cell 1" instead of dying mid-run on stale code.
+__studio_abi__ = 3
 __all__ = [
     # Core pipelines
     "WeeBasePipeline",

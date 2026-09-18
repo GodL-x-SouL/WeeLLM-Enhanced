@@ -29,10 +29,13 @@ def maybe_disable_image_crf(pipeline, kwargs: dict) -> bool:
     try:
         import inspect
         params = inspect.signature(pipeline.__call__).parameters
-        if "image_crf" in params and "image_crf" not in kwargs:
-            kwargs["image_crf"] = 0
-            logger.info("[WeeLLM] PyAV missing: image_crf=0 (skipping start-frame re-compression).")
-            return True
+        # Kwarg name drifted across diffusers revisions (image_crf vs crf):
+        # set whichever the installed pipeline accepts, never both blindly.
+        for _name in ("image_crf", "crf"):
+            if _name in params and _name not in kwargs:
+                kwargs[_name] = 0
+                logger.info("[WeeLLM] PyAV missing: %s=0 (skipping start-frame re-compression).", _name)
+                return True
     except Exception:
         pass
     return False
