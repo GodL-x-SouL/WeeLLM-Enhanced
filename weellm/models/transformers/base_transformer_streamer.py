@@ -453,9 +453,11 @@ class BaseTransformerStreamer(ABC):
 
         t2 = time.time()
 
-        logger.debug(
-            "    [Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs",
+        _slow = (t1 - t0) > 60.0
+        logger.info(
+            "    [Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs%s",
             shard_name, pos + 1, len(self._shard_order), t1 - t0, t2 - t1,
+            "  <-- SLOW BLOCK (over 60s load; still alive, just slow)" if _slow else "",
         )
         setattr(module, "_weellm_t_compute_start", time.time())
 
