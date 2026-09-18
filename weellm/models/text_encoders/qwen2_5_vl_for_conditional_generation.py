@@ -26,6 +26,9 @@ from weellm.io.memory import place_tensors, evict_module
 from weellm.io.seeker import get_seeker
 from accelerate.utils.modeling import set_module_tensor_to_device
 
+import logging
+logger = logging.getLogger("weellm")
+
 
 # The same prompt template used by QwenImagePipeline
 PROMPT_TEMPLATE = (
@@ -310,11 +313,11 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
 
         model_dir = Path(model_dir)
 
-        print("  [TE 1/3] Initializing LiveSeeker on Qwen text encoder weights ...")
+        logger.info("  [TE 1/3] Initializing LiveSeeker on Qwen text encoder weights ...")
         seeker = get_seeker(model_dir, cache_to_ram=cache_to_ram)
-        print(f"    Found {len(seeker.weight_map)} tensors.")
+        logger.info(f"    Found {len(seeker.weight_map)} tensors.")
 
-        print("  [TE 2/3] Instantiating Qwen2_5_VLForConditionalGeneration on meta device ...")
+        logger.info("  [TE 2/3] Instantiating Qwen2_5_VLForConditionalGeneration on meta device ...")
         with default_dtype(dtype), init_empty_weights():
             from transformers import Qwen2_5_VLConfig
             cfg = Qwen2_5_VLConfig.from_pretrained(str(model_dir))
@@ -339,7 +342,7 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
                 else:
                     set_module_tensor_to_device(model, buf_name, device, value=buf)
 
-        print("  [TE 3/3] Loading resident Qwen text encoder tensors ...")
+        logger.info("  [TE 3/3] Loading resident Qwen text encoder tensors ...")
         resident_keys = _get_resident_keys(seeker, is_edit_model=is_edit_model)
         resident_sd = seeker.get_tensors(resident_keys, device="cpu", dtype=dtype)
         
@@ -511,7 +514,7 @@ class Qwen2_5_VLForConditionalGenerationStreamer:
             pass
 
         layer_count = len(model.model.language_model.layers)
-        print(f"    -> {layer_count} Qwen layers will stream on-demand.")
+        logger.info(f"    -> {layer_count} Qwen layers will stream on-demand.")
         report_memory("After Qwen text encoder init")
 
         instance = cls(

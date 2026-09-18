@@ -267,11 +267,11 @@ class WeeVideoPipeline(WeeBasePipeline):
                             import os
                             resume_idx = int(os.environ.get("WEELLM_RESUME_STEP", "0"))
                             if i < resume_idx:
-                                print(f"\n!!! Fast-Forwarding: Skipping Step {i} !!!")
+                                logger.info(f"\n!!! Fast-Forwarding: Skipping Step {i} !!!")
                                 if i == resume_idx - 1:
                                     resume_path = os.environ.get("WEELLM_RESUME_PATH", "")
                                     if resume_path and os.path.exists(resume_path):
-                                        print(f"!!! Injecting Latents from {resume_path} !!!\n")
+                                        logger.info(f"!!! Injecting Latents from {resume_path} !!!\n")
                                         import torch
                                         cached = torch.load(resume_path, map_location="cpu")
                                         if isinstance(cached, torch.Tensor):

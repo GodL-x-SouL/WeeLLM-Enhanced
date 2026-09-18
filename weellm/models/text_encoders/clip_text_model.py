@@ -23,6 +23,9 @@ from weellm.io.seeker import get_seeker
 from weellm.io.utils import clean_memory, report_memory
 from weellm.io.memory import place_tensors, evict_module
 
+import logging
+logger = logging.getLogger("weellm")
+
 
 def _patch_forward_input_device(model: nn.Module, target_device: str = "cuda"):
     """Move CLIP text inputs onto the model device before forward runs."""
@@ -140,10 +143,10 @@ class CLIPTextModelStreamer:
         import os
         path = os.path.join(model_dir, subfolder)
 
-        print(f"Initializing SafetensorsLiveSeeker on {subfolder} weights ...")
+        logger.info(f"Initializing SafetensorsLiveSeeker on {subfolder} weights ...")
         seeker = get_seeker(path, cache_to_ram=cache_to_ram)
 
-        print(f"Loading resident tensors to GPU for {subfolder} ...")
+        logger.info(f"Loading resident tensors to GPU for {subfolder} ...")
 
         # Instantiate on meta device
         config = model_cls.config_class.from_pretrained(path)
@@ -217,7 +220,7 @@ class CLIPTextModelStreamer:
             num_layers = len(model.text_model.encoder.layers)
         else:
             num_layers = len(model.encoder.layers)
-        print(f"  -> {num_layers} encoder layers will stream on-demand. Resident weights on GPU.")
+        logger.info(f"  -> {num_layers} encoder layers will stream on-demand. Resident weights on GPU.")
 
         return cls(model, seeker, seeker_layer_prefix, model_layer_prefix, device, dtype, output_hidden_states)
 

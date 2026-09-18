@@ -20,6 +20,9 @@ from transformers import AutoConfig, AutoModel
 from weellm.io.utils import clean_memory
 from weellm.io.seeker import get_seeker
 
+import logging
+logger = logging.getLogger("weellm")
+
 
 def _get_resident_keys(seeker) -> List[str]:
     # Everything that is not a layer block is resident, EXCLUDING the lm_head
@@ -59,14 +62,14 @@ class Qwen3VLModelStreamer:
     def _ensure_initialized(self):
         if self._initialized:
             return
-        print("Initialising streaming Qwen3VL text encoder ...")
+        logger.info("Initialising streaming Qwen3VL text encoder ...")
         self._seeker = get_seeker(self.text_encoder_dir, cache_to_ram=self.cache_to_ram)
         self._load_model_skeleton()
         self._load_resident_modules()
         self._install_hooks()
         
         self._initialized = True
-        print("Qwen3VL text encoder ready (streaming via Live Seek).")
+        logger.info("Qwen3VL text encoder ready (streaming via Live Seek).")
 
     def _load_model_skeleton(self):
         config = AutoConfig.from_pretrained(str(self.text_encoder_dir), trust_remote_code=True)

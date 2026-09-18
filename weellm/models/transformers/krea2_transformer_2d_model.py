@@ -42,7 +42,7 @@ class VRAMTracker(TorchDispatchMode):
             current_vram = torch.cuda.memory_allocated() / (1024**3)
             if current_vram > self.max_vram:
                 self.max_vram = current_vram
-                print(f"[Tracker] {func.__name__} | Peak VRAM: {current_vram:.3f} GB", flush=True)
+                logger.debug(f"[Tracker] {func.__name__} | Peak VRAM: {current_vram:.3f} GB")
         return out
 
 _STREAMING_PREFIXES = ("text_fusion.layerwise_blocks.", "text_fusion.refiner_blocks.", "transformer_blocks.")

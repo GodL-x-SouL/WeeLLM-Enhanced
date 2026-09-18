@@ -28,6 +28,9 @@ from weellm.io.utils import clean_memory, report_memory
 from weellm.io.memory import place_tensors, evict_module
 from accelerate.utils.modeling import set_module_tensor_to_device
 
+import logging
+logger = logging.getLogger("weellm")
+
 
 
 class UMT5EncoderModelStreamer:
@@ -96,11 +99,11 @@ class UMT5EncoderModelStreamer:
     ) -> "UMT5EncoderModelStreamer":
         from transformers import UMT5EncoderModel
 
-        print(f"Initializing SafetensorsLiveSeeker on text_encoder weights ...")
+        logger.info(f"Initializing SafetensorsLiveSeeker on text_encoder weights ...")
         seeker = get_seeker(model_dir, cache_to_ram=cache_to_ram)
-        print(f"  Found {len(seeker.weight_map)} tensors.")
+        logger.info(f"  Found {len(seeker.weight_map)} tensors.")
 
-        print(f"Instantiating UMT5EncoderModel on meta device ...")
+        logger.info(f"Instantiating UMT5EncoderModel on meta device ...")
         config = UMT5EncoderModel.config_class.from_pretrained(model_dir)
         with default_dtype(dtype), init_empty_weights():
             model = UMT5EncoderModel(config)
@@ -121,7 +124,7 @@ class UMT5EncoderModelStreamer:
             return any(k.startswith(p) or k == p for p in resident_prefixes)
 
         resident_keys = [k for k in seeker.weight_map if is_resident(k)]
-        print(f"Loading resident UMT5 tensors ({len(resident_keys)} tensors) ...")
+        logger.info(f"Loading resident UMT5 tensors ({len(resident_keys)} tensors) ...")
         resident_sd = seeker.get_tensors(resident_keys, device="cpu", dtype=dtype)
         
         cpu_sd = {k: v for k, v in resident_sd.items() if k.startswith("shared.")}
@@ -146,7 +149,7 @@ class UMT5EncoderModelStreamer:
         clean_memory(device)
 
         num_blocks = len(model.encoder.block)
-        print(f"  -> {num_blocks} UMT5 encoder blocks will stream on-demand. Resident weights on GPU.")
+        logger.info(f"  -> {num_blocks} UMT5 encoder blocks will stream on-demand. Resident weights on GPU.")
         report_memory("After UMT5 encoder init")
 
         return cls(model, seeker, device, dtype, max_length)

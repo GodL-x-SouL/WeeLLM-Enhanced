@@ -80,9 +80,9 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
             if torch.cuda.is_available():
                 used = torch.cuda.memory_allocated() / 1e9
                 resv = torch.cuda.memory_reserved() / 1e9
-                print(f"    [VAE Streamer] Temporal chunk #{chunk_num} done  VRAM {used:.2f}/{resv:.2f} GB", flush=True)
+                logger.info(f"    [VAE Streamer] Temporal chunk #{chunk_num} done  VRAM {used:.2f}/{resv:.2f} GB")
             else:
-                print(f"    [VAE Streamer] Temporal chunk #{chunk_num} done", flush=True)
+                logger.info(f"    [VAE Streamer] Temporal chunk #{chunk_num} done")
 
         return args
 
@@ -166,9 +166,9 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(cache_dir, "vae_decode_cache.pt")
         if os.path.exists(cache_file):
-            print(f"    [VAE Streamer] Loading cached decoded video from {cache_file} ...", flush=True)
+            logger.info(f"    [VAE Streamer] Loading cached decoded video from {cache_file} ...")
             result = torch.load(cache_file, map_location=latents.device)
-            print(f"    [VAE Streamer] Cached decode loaded: {tuple(result.shape)}", flush=True)
+            logger.info(f"    [VAE Streamer] Cached decode loaded: {tuple(result.shape)}")
         else:
             with torch.no_grad():
                 report_memory("Before VAE decode")
@@ -179,9 +179,9 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
                 # out is a tuple; out[0] is the decoded video tensor
                 result = out[0] if isinstance(out, (tuple, list)) else out
                 report_memory("After VAE decode")
-                print(f"    [VAE Streamer] decode done: {tuple(result.shape)}", flush=True)
+                logger.info(f"    [VAE Streamer] decode done: {tuple(result.shape)}")
 
-            print(f"    [VAE Streamer] Saving video decode cache to {cache_file} ...", flush=True)
+            logger.info(f"    [VAE Streamer] Saving video decode cache to {cache_file} ...")
             torch.save(result.cpu(), cache_file)
             result = result.to(latents.device)
 

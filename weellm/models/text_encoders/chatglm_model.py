@@ -16,6 +16,9 @@ from weellm.io.utils import default_dtype
 from weellm.io.memory import place_tensors, pin_module_to_cpu
 from weellm.models.text_encoders.base_text_encoder_streamer import BaseLazyDecoderStreamer
 
+import logging
+logger = logging.getLogger("weellm")
+
 
 class ChatGLMModelStreamer(BaseLazyDecoderStreamer):
     """Streaming text encoder for ChatGLMModel (Kolors)."""
@@ -138,10 +141,8 @@ class ChatGLMModelStreamer(BaseLazyDecoderStreamer):
             self._model.transformer.embedding.register_forward_hook(_embedding_forward_hook)
 
     def _load_tokenizer(self) -> None:
-        print("DEBUG: _load_tokenizer starting", flush=True)
+        logger.debug("_load_tokenizer starting")
         import importlib.util
-        import logging
-        logger = logging.getLogger("weellm")
         local_repo = Path(self.tokenizer_dir)
         model_dir = local_repo.parent if local_repo.name == "tokenizer" else local_repo
         
