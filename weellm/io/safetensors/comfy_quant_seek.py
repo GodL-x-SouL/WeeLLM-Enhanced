@@ -27,7 +27,13 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 
-from weellm.io.comfy_quant import classify_quant_groups, dequantize_int8, dequantize_w4a8
+from weellm.io.comfy_quant import (
+    classify_quant_groups,
+    dequantize_int4,
+    dequantize_int8,
+    dequantize_w4a8,
+    strip_comfy_prefix,
+)
 from weellm.io.safetensors.safetensors_base import DTYPE_MAP, SafetensorsBase
 
 logger = logging.getLogger("weellm")
@@ -39,6 +45,17 @@ class ComfyQuantSeeker(SafetensorsBase):
     def __init__(self, model_dir: Union[str, Path]):
         super().__init__(model_dir)
         self._parse_index()
+        # Normalize Comfy single-file prefixes (model.diffusion_model.*) to
+        # the diffusers namespace streamers match on. _raw_map translates
+        # logical keys back to on-disk names for reading.
+        raw_map: Dict[str, str] = {}
+        stripped: Dict[str, str] = {}
+        for k, v in self.weight_map.items():
+            sk = strip_comfy_prefix(k)
+            stripped[sk] = v
+            raw_map[sk] = k
+        self.weight_map = stripped
+        self._raw_map = raw_map
         # {logical_key: spec}; spec holds kind + companion key names + files.
         self.groups: Dict[str, dict] = {}
         # companion keys (scales/codebooks/blobs) hidden from weight_map.
@@ -46,7 +63,9 @@ class ComfyQuantSeeker(SafetensorsBase):
         for shard in sorted(set(self.weight_map.values())):
             header, _ = self._read_header(self.model_dir / shard)
             self._apply_file_metadata(header)
-            for logical, spec in classify_quant_groups(header).items():
+            for logical_raw, spec in classify_quant_groups(header).items():
+                logical = strip_comfy_prefix(logical_raw)
+                spec = {kk: (strip_comfy_prefix(vv) if isinstance(vv, str) else vv) for kk, vv in spec.items()}
                 spec = dict(spec)
                 spec["file"] = self.weight_map.get(logical, shard)
                 for ck in ("s_rel", "s_channel", "codebook", "scale"):
@@ -64,14 +83,20 @@ class ComfyQuantSeeker(SafetensorsBase):
         file_layers = getattr(self, "_file_layers", {})
         if file_layers:
             for logical, spec in self.groups.items():
-                if spec["kind"] != "int8" or spec.get("convrot"):
+                if spec.get("convrot") and spec["kind"] == "int8":
                     continue
                 prefix = logical[: -len(".weight")]
                 for layer, info in file_layers.items():
                     if not isinstance(info, dict):
                         continue
                     if prefix == layer or prefix.endswith("." + layer) or prefix.endswith("/" + layer):
-                        if info.get("convrot", False):
+                        fmt = str(info.get("format", "")).lower()
+                        if fmt == "convrot_w4a4" and spec["kind"] == "int8":
+                            spec["kind"] = "int4"
+                        if spec["kind"] == "int4":
+                            spec["convrot_groupsize"] = int(info.get("convrot_groupsize", 256))
+                            spec["quant_group_size"] = int(info.get("quant_group_size", 64))
+                        elif spec["kind"] == "int8" and info.get("convrot", False):
                             spec["convrot"] = True
                             spec["convrot_groupsize"] = int(info.get("convrot_groupsize", 256))
                         break
@@ -81,13 +106,15 @@ class ComfyQuantSeeker(SafetensorsBase):
         n_i8cr = sum(
             1 for s in self.groups.values() if s["kind"] == "int8" and s.get("convrot")
         )
+        n_i4 = sum(1 for s in self.groups.values() if s["kind"] == "int4")
         logger.info(
-            "[ComfyQuantSeeker] %s: %d quantized (%d w4a8 / %d int8, of which %d convrot) + %d plain tensors.",
+            "[ComfyQuantSeeker] %s: %d quantized (%d w4a8 / %d int8, of which %d convrot / %d int4) + %d plain tensors.",
             self.model_dir.name if isinstance(self.model_dir, Path) else self.model_dir,
             len(self.groups),
             sum(1 for s in self.groups.values() if s["kind"] == "w4a8"),
             sum(1 for s in self.groups.values() if s["kind"] == "int8"),
             n_i8cr,
+            n_i4,
             n_plain,
         )
 
@@ -129,19 +156,40 @@ class ComfyQuantSeeker(SafetensorsBase):
             return
         if not isinstance(blob, dict):
             return
+        # Writers put tunables either top-level or under "params" (Comfy
+        # prefers top-level, falls back to nested) -- merge the same way.
+        nested = blob.get("params", {})
+        if not isinstance(nested, dict):
+            nested = {}
+        conf = {**nested, **blob}
+        fmt = str(conf.get("format", "")).lower()
+        if fmt == "convrot_w4a4" and spec["kind"] == "int8":
+            # Same .weight_scale companions as INT8 -- the blob decides.
+            spec["kind"] = "int4"
         if spec["kind"] == "int8":
-            if blob.get("convrot", False):
+            if conf.get("convrot", False):
                 spec["convrot"] = True
-            spec["convrot_groupsize"] = int(blob.get("convrot_groupsize", 256))
+            spec["convrot_groupsize"] = int(conf.get("convrot_groupsize", 256))
         elif spec["kind"] == "w4a8":
-            spec["group_size"] = int(blob.get("group_size", spec.get("group_size", 16)))
+            spec["group_size"] = int(conf.get("group_size", spec.get("group_size", 16)))
             spec["convrot_groupsize"] = int(
-                blob.get("convrot_groupsize", spec.get("convrot_groupsize", 256))
+                conf.get("convrot_groupsize", spec.get("convrot_groupsize", 256))
             )
+        elif spec["kind"] == "int4":
+            spec["convrot_groupsize"] = int(
+                conf.get("convrot_groupsize", spec.get("convrot_groupsize", 256))
+            )
+            spec["quant_group_size"] = int(
+                conf.get("quant_group_size", spec.get("quant_group_size", 64))
+            )
+
+    def _raw(self, key: str) -> str:
+        """Logical (diffusers-namespace) key -> on-disk safetensors key."""
+        return self._raw_map.get(key, key)
 
     def _read_raw(self, header: dict, data_base: int, filepath: Path, key: str) -> torch.Tensor:
         """Read one raw tensor (no dtype cast) from an open header context."""
-        meta = header[key]
+        meta = header[self._raw(key)]
         dtype_str, shape = meta["dtype"], meta["shape"]
         start, _ = meta["data_offsets"]
         np_dtype = DTYPE_MAP[dtype_str]
@@ -173,12 +221,12 @@ class ComfyQuantSeeker(SafetensorsBase):
 
     def _logical_shape(self, key: str) -> tuple:
         spec = self.groups[key]
-        if spec["kind"] == "w4a8":
+        if spec["kind"] in ("w4a8", "int4"):
             header, _ = self._read_header(self.model_dir / spec["file"])
-            stored = tuple(header[spec["weight"]]["shape"])
+            stored = tuple(header[self._raw(spec["weight"])]["shape"])
             return (stored[0], stored[1] * 2)
         header, _ = self._read_header(self.model_dir / spec["file"])
-        return tuple(header[spec["weight"]]["shape"])
+        return tuple(header[self._raw(spec["weight"])]["shape"])
 
     # ------------------------------------------------------------------
     # Seeker interface
@@ -231,6 +279,16 @@ class ComfyQuantSeeker(SafetensorsBase):
                         codebook=cb,
                         group_size=spec.get("group_size", 16),
                         convrot_groupsize=spec.get("convrot_groupsize", 256),
+                        dtype=target,
+                    )
+                elif spec["kind"] == "int4":
+                    q = self._load_piece(spec, "weight", src_file)
+                    sc = self._load_piece(spec, "scale", src_file)
+                    t = dequantize_int4(
+                        q,
+                        sc,
+                        convrot_groupsize=spec.get("convrot_groupsize", 256),
+                        quant_group_size=spec.get("quant_group_size", 64),
                         dtype=target,
                     )
                 else:  # int8

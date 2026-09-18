@@ -61,9 +61,23 @@ __all__ = [
     "rotate_weight",
     "dequantize_int8",
     "dequantize_w4a8",
+    "dequantize_int4",
     "classify_quant_groups",
     "is_quantized_key",
+    "strip_comfy_prefix",
 ]
+
+# Comfy single-file checkpoints wrap the diffusion transformer in this
+# prefix (diffusers repos instead use transformer/... + connectors/...).
+# WeeLLM streamers match diffusers-namespaced keys, so the seeker strips it.
+_COMFY_DIFFUSION_PREFIX = "model.diffusion_model."
+
+
+def strip_comfy_prefix(key: str) -> str:
+    """``model.diffusion_model.X`` -> ``X`` (LTX single-file convention)."""
+    if key.startswith(_COMFY_DIFFUSION_PREFIX):
+        return key[len(_COMFY_DIFFUSION_PREFIX):]
+    return key
 
 # ---------------------------------------------------------------------------
 # Hadamard (ConvRot) helpers -- ported from comfy_kitchen.tensor.int8_utils.
@@ -212,6 +226,59 @@ def dequantize_w4a8(
     out = torch.matmul(
         out.view(n, g, convrot_groupsize), h.T.to(device=out.device, dtype=out.dtype)
     ).view(n, k)
+    return out.to(out_dtype)
+
+
+# ---------------------------------------------------------------------------
+# INT4 (ConvRot W4A4) -- ported from comfy_kitchen.backends.eager.convrot_w4a4
+# (dequantize_convrot_w4a4_weight + svdquant nibble codec).
+#
+# On disk, per quantized <prefix>:  <prefix>.weight (int8, [N, K/2], two
+# SIGNED int4 codes per byte, low nibble = even column) + <prefix>.weight_scale
+# (fp32, [N] per-row). Same companion names as INT8 -- the two are told apart
+# by the comfy_quant blob / _quantization_metadata ``format`` field
+# (``convrot_w4a4`` vs ``int8_tensorwise``); without any marker the group is
+# treated as plain INT8.
+# ---------------------------------------------------------------------------
+
+
+def _unpack_int4_signed(packed: torch.Tensor, k: int) -> torch.Tensor:
+    """Row-major nibble unpack with signed interpretation ([-8, 7])."""
+    x32 = packed.to(torch.int32)
+    lo = x32 & 0x0F
+    hi = (x32 >> 4) & 0x0F
+    lo = torch.where(lo >= 8, lo - 16, lo)
+    hi = torch.where(hi >= 8, hi - 16, hi)
+    return torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1).to(torch.int8)
+
+
+def dequantize_int4(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = 64,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Decode one INT4-ConvRot group to a floating ``[N, K]`` weight matrix.
+
+    Steps: signed-nibble unpack -> per-row scale -> Hadamard un-rotation in
+    float32 (same order as ComfyUI) -> cast to ``dtype``.
+    """
+    if qdata.dim() != 2:
+        raise ValueError(f"INT4 qdata must be 2D, got {qdata.dim()}D")
+    n, k_half = qdata.shape
+    k = k_half * 2
+    if k % convrot_groupsize != 0 or k % quant_group_size != 0:
+        raise ValueError(
+            f"INT4 K={k} must be divisible by convrot_groupsize={convrot_groupsize} "
+            f"and quant_group_size={quant_group_size}"
+        )
+    if tuple(scale.shape) not in ((n,), (n, 1)):
+        raise ValueError(f"INT4 scale must be {(n,)} or {(n, 1)}, got {tuple(scale.shape)}")
+    w = _unpack_int4_signed(qdata, k).to(torch.float32)
+    w = w * scale.to(torch.float32).reshape(n, 1)
+    out = rotate_weight(w, convrot_groupsize)
+    out_dtype = dtype if dtype is not None else torch.bfloat16
     return out.to(out_dtype)
 
 

@@ -85,7 +85,13 @@ def _looks_like_comfy_quant(path: Path) -> bool:
                 ip = path / idx
                 if ip.exists():
                     wm = _json.loads(ip.read_text())["weight_map"]
+                    # .weight_s_rel is W4A8-only (unambiguous). .weight_scale
+                    # covers INT8/W4A4 packs; FP8 checkpoints also use that
+                    # name but still load correctly through ComfyQuantSeeker's
+                    # plain-tensor path, so routing them here is harmless.
                     if any(k.endswith(".weight_s_rel") for k in wm):
+                        return True
+                    if any(k.endswith(".weight_scale") for k in wm):
                         return True
                     return False
             shards = sorted(path.glob("*.safetensors"))
