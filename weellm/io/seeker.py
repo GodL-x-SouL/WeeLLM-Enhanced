@@ -50,12 +50,62 @@ def override_weights_path(path: Union[str, Path, None], subfolder: str = None):
         _override_local.weights_path = old_path
         _override_local.subfolder = old_sub
 
+def _looks_like_comfy_quant(path: Path) -> bool:
+    """True if a safetensors file/dir contains Comfy-style quant companions.
+
+    Detection is deliberately strict so plain BF16/FP8 checkpoints never
+    route here: requires a ``*.weight_s_rel`` key (W4A8, unambiguous), or an
+    INT8 ``*.weight`` with a sibling ``*.weight_scale``. Header JSON only --
+    no tensor data is read.
+    """
+    import json as _json
+    import struct as _struct
+
+    def _header_of(fp: Path):
+        with open(fp, "rb") as f:
+            raw = f.read(8)
+            if len(raw) < 8:
+                return {}
+            (hsize,) = _struct.unpack("<Q", raw)
+            return _json.loads(f.read(hsize).decode("utf-8"))
+
+    try:
+        if path.is_file() and path.suffix.lower() == ".safetensors":
+            header = _header_of(path)
+            keys = set(header) - {"__metadata__"}
+            if any(k.endswith(".weight_s_rel") for k in keys):
+                return True
+            for k in keys:
+                if k.endswith(".weight") and header.get(k, {}).get("dtype") == "I8":
+                    if k[: -len(".weight")] + ".weight_scale" in keys:
+                        return True
+            return False
+        if path.is_dir():
+            for idx in ("model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json"):
+                ip = path / idx
+                if ip.exists():
+                    wm = _json.loads(ip.read_text())["weight_map"]
+                    if any(k.endswith(".weight_s_rel") for k in wm):
+                        return True
+                    return False
+            shards = sorted(path.glob("*.safetensors"))
+            if len(shards) == 1:
+                return _looks_like_comfy_quant(shards[0])
+    except Exception:
+        return False
+    return False
+
+
 def get_seeker(model_dir: Union[str, Path], cache_to_ram: bool = False):
     """
     Factory function to return the appropriate tensor seeker.
 
     - **.gguf file path**: returns a GGUFSeeker that dequantizes weights on the
       fly using pure PyTorch — no custom CUDA compilation required.
+    - **Comfy-quant safetensors (INT8 / W4A8, possibly mixed with BF16/F32)**:
+      returns a ComfyQuantSeeker that decodes quantized groups at load time
+      (pure PyTorch, no comfy-kitchen required). Detection is automatic via
+      companion-key presence; plain checkpoints are unaffected.
     - **directory (default)**: returns SafetensorsRAMSeeker when cache_to_ram
       is True, otherwise SafetensorsDiskSeeker (original behaviour).
     """
@@ -164,6 +214,16 @@ def get_seeker(model_dir: Union[str, Path], cache_to_ram: bool = False):
         # Prevent double-appending if model_dir_path already contains the subfolder
         if not model_dir_path.name == final_target_subfolder:
             model_dir_path = model_dir_path / final_target_subfolder
+
+    # ── Comfy-quant quantized safetensors (INT8 / W4A8, mixed files) ──────
+    # Disk-streamed with on-the-fly pure-PyTorch dequant; independent of the
+    # cache_to_ram flag (whole-file RAM caching would defeat the purpose).
+    try:
+        if _looks_like_comfy_quant(model_dir_path):
+            from weellm.io.safetensors.comfy_quant_seek import ComfyQuantSeeker
+            return ComfyQuantSeeker(model_dir_path)
+    except Exception as e:
+        logger.debug("Comfy-quant detection skipped (%s); using default seeker.", e)
 
     if cache_to_ram:
         from weellm.io.safetensors.ram_seek import SafetensorsRAMSeeker

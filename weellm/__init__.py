@@ -41,6 +41,7 @@ __all__ = [
     "SafetensorsDiskSeeker",
     "SafetensorsRAMSeeker",
     "GGUFSeeker",
+    "ComfyQuantSeeker",
     "dequantize_tensor",
     # VAE
     "AutoencoderKL",
@@ -97,6 +98,7 @@ from .io.safetensors.safetensors_base import SafetensorsBase  # noqa: E402
 from .io.safetensors.disk_seek import SafetensorsDiskSeeker  # noqa: E402
 from .io.safetensors.ram_seek import SafetensorsRAMSeeker  # noqa: E402
 from .io.ggufs.gguf_seek import GGUFSeeker  # noqa: E402
+from .io.safetensors.comfy_quant_seek import ComfyQuantSeeker  # noqa: E402
 from .io.ggufs.gguf_dequant import dequantize_tensor  # noqa: E402
 
 # VAE
@@ -117,7 +119,13 @@ from .models.transformers.ideogram4_transformer          import Ideogram4Transfo
 from .models.transformers.ernie_image_transformer_2d_model import ErnieImageTransformer2DModelStreamer  # noqa: E402
 from .models.transformers.krea2_transformer_2d_model import Krea2Transformer2DModelStreamer  # noqa: E402
 from .models.transformers.longcat_transformer_2d_model import LongCatImageTransformer2DModelStreamer  # noqa: E402
-from .models.transformers.ltx2_connectors import LTX2ConnectorsStreamer  # noqa: E402
+try:
+    from .models.transformers.ltx2_connectors import LTX2ConnectorsStreamer  # noqa: E402
+except Exception as _e:  # diffusers/torchao mismatch must not break `import weellm`
+    import logging as _logging
+
+    _logging.getLogger("weellm").warning("LTX2ConnectorsStreamer unavailable: %s", _e)
+    LTX2ConnectorsStreamer = None  # type: ignore
 from .models.transformers.ltx2_video_transformer_3d_model import LTX2VideoTransformer3DModelStreamer  # noqa: E402
 from .models.transformers.minimax_h3_transformer_3d_model import MiniMaxH3Transformer3DModelStreamer  # noqa: E402
 

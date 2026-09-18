@@ -1,9 +1,34 @@
-from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+"""LTX-2 connectors streamer.
+
+NOTE: the diffusers import is intentionally lazy (inside methods, not at
+module top-level). diffusers>=recent pulls ``diffusers.loaders.peft`` which
+requires ``torchao>=0.15`` (``FqnToConfig``). On Colab the preinstalled
+torchao is older, so an eager import makes ``import weellm`` crash during
+Cell 1 verification with:
+``cannot import name 'FqnToConfig' from 'torchao.quantization'``.
+Lazy import keeps ``import weellm`` working; only actual LTX-2 use raises,
+with an actionable message.
+"""
+
 from .base_transformer_streamer import BaseTransformerStreamer
+
+
+def _load_connectors_cls():
+    try:
+        from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+
+        return LTX2TextConnectors
+    except Exception as e:
+        raise ImportError(
+            "LTX-2 connectors require a compatible diffusers+torchao pair. "
+            "Fix: pip install -U torchao peft diffusers "
+            "(torchao>=0.15 provides torchao.quantization.FqnToConfig). "
+            f"Original error: {type(e).__name__}: {e}"
+        ) from e
 
 class LTX2ConnectorsStreamer(BaseTransformerStreamer):
     def _get_model_cls(self):
-        return LTX2TextConnectors
+        return _load_connectors_cls()
 
     def _get_resident_keys(self):
         return [
@@ -80,7 +105,8 @@ class LTX2ConnectorsStreamer(BaseTransformerStreamer):
         from accelerate import init_empty_weights
         from weellm.io.seeker import get_seeker
         from weellm.io.utils import default_dtype
-        
+
+        LTX2TextConnectors = _load_connectors_cls()
         transformer_dir = Path(transformer_dir)
         seeker = get_seeker(transformer_dir, cache_to_ram=cache_to_ram)
         
