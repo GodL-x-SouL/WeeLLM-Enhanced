@@ -237,8 +237,10 @@ class BaseTransformerStreamer(ABC):
             
             
             estimated_ram_overhead = getattr(self.__class__, "_estimated_ram_overhead_bytes", 0)
-            usable = max(0, available - _RAM_SAFETY_BYTES - estimated_ram_overhead)
-            depth = max(1, min(_MAX_PREFETCH_DEPTH, int(usable // max_block_bytes)))
+            from weellm.io.utils import host_ram_caps
+            _max_depth, _safety = host_ram_caps()
+            usable = max(0, available - max(_RAM_SAFETY_BYTES, _safety) - estimated_ram_overhead)
+            depth = max(1, min(_MAX_PREFETCH_DEPTH, _max_depth, int(usable // max_block_bytes)))
         except ImportError:
             depth = 1
 

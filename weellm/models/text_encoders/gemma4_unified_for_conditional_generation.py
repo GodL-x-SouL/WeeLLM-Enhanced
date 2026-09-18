@@ -7,7 +7,7 @@ from transformers import Gemma2Model, Gemma2Config, Gemma3Config
 from transformers.models.gemma3.modeling_gemma3 import Gemma3TextModel
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from weellm.io.memory import evict_module, place_tensors
+from weellm.io.memory import evict_module, place_tensors, pin_module_to_cpu
 from weellm.io.seeker import get_seeker
 import logging
 
@@ -33,18 +33,18 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         if self.prefetch:
             try:
                 import psutil
-                _RAM_SAFETY_BYTES = 2 * 1024 * 1024 * 1024
-                _MAX_PREFETCH_DEPTH = 6
+                from weellm.io.utils import host_ram_caps
+                _max_depth, _safety = host_ram_caps()
                 sample_keys = [k for k in self.seeker.weight_map if k.startswith(self._shard_order[0] + ".")]
                 layer_bytes = self.seeker.get_block_bytes(sample_keys)
                 available = psutil.virtual_memory().available
-                usable = max(0, available - _RAM_SAFETY_BYTES)
-                
+                usable = max(0, available - _safety)
+
                 if usable <= 0:
                     logger.warning("[TE Streamer] Available RAM (%.1f GB) below safety threshold. Disabling TE prefetch.", available / 1e9)
                     self._prefetch_depth = 0
                 else:
-                    self._prefetch_depth = max(1, min(_MAX_PREFETCH_DEPTH, int(usable // layer_bytes)))
+                    self._prefetch_depth = max(1, min(_max_depth, int(usable // layer_bytes)))
                     logger.info(
                         "[TE Streamer] Adaptive prefetch depth: %d (layer=%.0f MB, usable RAM=%.1f GB)",
                         self._prefetch_depth, layer_bytes / 1e6, usable / 1e9,
@@ -254,24 +254,59 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
             prefetch=prefetch,
         )
 
-        logger.info("Step 3/3 -- Loading resident tensors ...")
+        logger.info("Step 3/3 -- Loading resident tensors (chunked, ~1GB at a time) ...")
         resident_keys = streamer._get_resident_keys()
-        sd = seeker.get_tensors(resident_keys, device=device, dtype=dtype)
-        
-        mapped_sd = {}
-        for k, v in sd.items():
-            if k.startswith("model.language_model."):
-                mapped_sd[k[len("model.language_model."):]] = v
-            elif k.startswith("model."):
-                mapped_sd[k[len("model."):]] = v
-            else:
-                mapped_sd[k] = v
-                
-        for mapped_k, mapped_v in mapped_sd.items():
-            try:
-                place_tensors(model, {mapped_k: mapped_v}, device, dtype, skip_errors=False)
-            except Exception as e:
-                logger.error(f"[TE Streamer] Failed to place resident tensor {mapped_k}: {repr(e)}")
-        del sd
-        
+        # The 2GB embedding table is looked up once per encode: it lives in
+        # CPU RAM (like the Qwen streamers do). Everything else goes to GPU.
+        embed_keys = [k for k in resident_keys if "embed_tokens" in k]
+        gpu_keys = [k for k in resident_keys if "embed_tokens" not in k]
+
+        def _place_batch(batch, tgt_device):
+            if not batch:
+                return
+            sd = seeker.get_tensors(batch, device=tgt_device, dtype=dtype)
+            for k, v in sd.items():
+                if k.startswith("model.language_model."):
+                    mk = k[len("model.language_model."):]
+                elif k.startswith("model."):
+                    mk = k[len("model."):]
+                else:
+                    mk = k
+                try:
+                    place_tensors(model, {mk: v}, tgt_device, dtype, skip_errors=False)
+                except Exception as e:
+                    logger.error(f"[TE Streamer] Failed to place resident tensor {mk}: {repr(e)}")
+            del sd
+
+        for keys, tgt in ((embed_keys, "cpu"), (gpu_keys, device)):
+            batch, batch_bytes = [], 0
+            for k in keys:
+                try:
+                    kb = seeker.get_block_bytes([k])
+                except Exception:
+                    kb = 0
+                if batch and batch_bytes + kb > 1024**3:
+                    _place_batch(batch, tgt)
+                    batch, batch_bytes = [], 0
+                batch.append(k)
+                batch_bytes += kb
+            _place_batch(batch, tgt)
+
+        # Run the embedding lookup on CPU and only move its tiny output to GPU.
+        try:
+            model.embed_tokens.to("cpu")
+            for _an in list(vars(model.embed_tokens)):
+                if _an.startswith("_"):
+                    continue
+                _av = getattr(model.embed_tokens, _an, None)
+                if isinstance(_av, torch.Tensor) and _av.device.type != "cpu":
+                    try:
+                        setattr(model.embed_tokens, _an, _av.to("cpu"))
+                    except Exception:
+                        pass
+            pin_module_to_cpu(model, "embed_tokens")
+            logger.info("[TE Streamer] embed_tokens pinned to CPU RAM (saves ~2GB VRAM).")
+        except Exception as e:
+            logger.warning("[TE Streamer] CPU embedding pin failed, keeping on %s: %s", device, e)
+
         return streamer

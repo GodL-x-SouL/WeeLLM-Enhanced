@@ -41,6 +41,25 @@ def clean_memory(device: str = "cuda") -> None:
     gc.collect()
 
 
+def host_ram_caps() -> tuple:
+    """Prefetch (max_depth, safety_bytes) suited to this host's RAM.
+
+    Multiple streamers (connectors + text encoder + transformer) compute
+    prefetch depth INDEPENDENTLY, so on small hosts (free Colab: ~13 GB)
+    their in-flight blocks add up and kill the session. On hosts below
+    16 GB total RAM we cap depth at 2 and reserve a quarter of RAM; bigger
+    hosts keep the historical (6, 2 GB) behaviour.
+    """
+    try:
+        import psutil
+        total = psutil.virtual_memory().total
+        if total < 16 * 1024**3:
+            return 2, max(2 * 1024**3, int(total * 0.25))
+        return 6, 2 * 1024**3
+    except ImportError:
+        return 1, 2 * 1024**3
+
+
 def report_memory(tag: str = "") -> None:
     """Log current VRAM and RAM usage at DEBUG level."""
     if torch.cuda.is_available():
