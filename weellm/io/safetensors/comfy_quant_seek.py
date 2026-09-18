@@ -102,13 +102,27 @@ class ComfyQuantSeeker(SafetensorsBase):
                         break
         if companions:
             self.weight_map = {k: v for k, v in self.weight_map.items() if k not in companions}
+        # Hide embedded non-tensor assets (U8 blobs like tokenizer_json or
+        # hf_asset__*.jinja that some packs bundle in the file). None of the
+        # supported quant formats uses U8 weights (INT8=I8, scales=F32/FP8),
+        # and leaving them exposed makes place_tensors throw a giant error.
+        n_assets = 0
+        for shard in sorted(set(self.weight_map.values())):
+            header, _ = self._read_header(self.model_dir / shard)
+            for k, meta in header.items():
+                if k == "__metadata__":
+                    continue
+                logical = strip_comfy_prefix(k)
+                if meta.get("dtype") == "U8" and logical in self.weight_map:
+                    del self.weight_map[logical]
+                    n_assets += 1
         n_plain = len(self.weight_map) - len(self.groups)
         n_i8cr = sum(
             1 for s in self.groups.values() if s["kind"] == "int8" and s.get("convrot")
         )
         n_i4 = sum(1 for s in self.groups.values() if s["kind"] == "int4")
         logger.info(
-            "[ComfyQuantSeeker] %s: %d quantized (%d w4a8 / %d int8, of which %d convrot / %d int4) + %d plain tensors.",
+            "[ComfyQuantSeeker] %s: %d quantized (%d w4a8 / %d int8, of which %d convrot / %d int4) + %d plain tensors (%d embedded assets hidden).",
             self.model_dir.name if isinstance(self.model_dir, Path) else self.model_dir,
             len(self.groups),
             sum(1 for s in self.groups.values() if s["kind"] == "w4a8"),
@@ -116,6 +130,7 @@ class ComfyQuantSeeker(SafetensorsBase):
             n_i8cr,
             n_i4,
             n_plain,
+            n_assets,
         )
 
     # ------------------------------------------------------------------
