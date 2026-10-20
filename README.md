@@ -163,6 +163,35 @@ python main.py \
 
 ---
 
+## T4 / 12 GB Colab Tuning
+
+Tesla T4 (Turing) has **15.6 GB VRAM**, **12.7 GB host RAM**, and no bf16 compute. WeeLLM already adapts at runtime, but these settings are the tested baseline:
+
+```bash
+python main.py \
+  --model /content/models/LTX-2.5 \
+  --transformer /content/models/ltx-2.5-Q4_K_M.gguf \
+  --prompt "..." \
+  --height 512 --width 768 --steps 20 \
+  --dtype auto \
+  --vram_budget 13 \
+  --prefetch_depth 2 \
+  --ram_cache_gb 2.5 \
+  --verbose
+```
+
+- `--dtype auto` selects **fp16 on T4** (bf16 is emulated and slower on Turing).
+- `--prefetch_depth 2` keeps two blocks in flight (staged GGUF/int8 reads on the copy stream). Deeper pipelining runs out of host RAM on Colab; WeeLLM caps it automatically from `host_ram_caps()`.
+- `--ram_cache_gb` caches **raw (still-quantized) blocks** of non-pinned layers, so later denoising steps skip the disk read and only do H2D + dequant. `0` disables it; `None` auto-selects (2 GB on <16 GB hosts).
+- `--vram_budget` reserves room for activations, latents, text encoder and the CUDA context. Increasing it pins more dequantized blocks and reduces per-step I/O. Leave `--ram_budget` unset on Colab so prefetch depth follows the measured free RAM.
+
+**Pinning reality check:** pinned blocks are stored **dequantized** in VRAM, so they are the same ~0.8 GB each for Q4, int8 and bf16. On a T4 only **~10-12 of 48 blocks** fit regardless of checkpoint format. Quantization still pays off because the **streamed** payload drops from ~27 GB (bf16) to ~2 GB (Q4) per denoising sweep.
+
+> [!NOTE]
+> The RAM cache is non-evicting and only targets non-pinned blocks. It is cleared during pin calibration so text-encoder/connector tensors do not consume the streaming budget.
+
+---
+
 ## ⚠️ Cloud vs. Local Execution Warning
 
 > [!WARNING]
@@ -310,7 +339,9 @@ pipe = WeeTextToImagePipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
     vram_budget=4, 
     ram_budget=4,
-    prefetch=False  # Recommended when using GGUF to avoid GPU contention
+    # GGUF reads now overlap with GPU dequantization; leave prefetch on.
+    # prefetch_depth=2,
+    # ram_cache_gb=2,  # optional: cache non-pinned raw blocks in host RAM
 )
 
 image = pipe.generate(

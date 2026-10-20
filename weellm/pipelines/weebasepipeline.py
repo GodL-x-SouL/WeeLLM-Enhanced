@@ -261,6 +261,8 @@ class WeeBasePipeline:
         torch_dtype: torch.dtype = torch.bfloat16,
         prefetch: bool = True,
         cache_to_ram: bool = False,
+        ram_cache_gb: Optional[float] = None,
+        prefetch_depth: Optional[int] = None,
         vae_tile_size: int = 256,
         **kwargs,
     ) -> "WeeBasePipeline":
@@ -284,6 +286,11 @@ class WeeBasePipeline:
         cache_to_ram:
             Load full safetensors shards into CPU RAM before serving tensors.
             Faster on slow cloud drives (Kaggle/Colab), uses more RAM.
+        ram_cache_gb:
+            Budget for the shared raw-block RAM cache (stored bytes only).
+            ``None`` auto-selects 2 GB on hosts with < 16 GB RAM, else 0.
+        prefetch_depth:
+            Override the adaptive disk-prefetch depth (number of blocks).
         vae_tile_size:
             Minimum tile size (in pixels) for aggressive VAE tiling.
             Smaller values reduce VRAM spikes at the cost of slight quality
@@ -338,6 +345,24 @@ class WeeBasePipeline:
         from weellm.models.transformers.base_transformer_streamer import BaseTransformerStreamer
         BaseTransformerStreamer._global_vram_budget_gb = vram_budget_gb
         BaseTransformerStreamer._global_ram_budget_gb = ram_budget_gb
+        BaseTransformerStreamer._global_prefetch_depth = (
+            int(prefetch_depth) if prefetch_depth is not None and int(prefetch_depth) > 0 else None
+        )
+
+        # Bounded cache of raw (pre-dequant) tensor bytes shared by all
+        # seekers. Keeps the streamed remainder off disk across steps without
+        # expanding quantized weights to bf16 in RAM.
+        from weellm.io.ram_cache import auto_ram_cache_budget, configure_ram_cache
+        cache_bytes = (
+            int(ram_cache_gb * 1024**3)
+            if ram_cache_gb is not None
+            else auto_ram_cache_budget()
+        )
+        configure_ram_cache(cache_bytes)
+        if cache_bytes > 0:
+            logger.info("[WeeLLM] Raw block RAM cache: %.1f GB (fixed subset, stored bytes only)", cache_bytes / 1e9)
+        else:
+            logger.info("[WeeLLM] Raw block RAM cache: disabled")
 
         # ── Step 1: Tokenizers & Scheduler ──────────────────────────────
         logger.info("[1/4] Loading Tokenizers and Scheduler ...")
@@ -880,6 +905,10 @@ class WeeBasePipeline:
                     kw["mu"] = mu
                 if "timesteps" in params and timesteps is not None:
                     kw["timesteps"] = timesteps
+                # Several schedulers (EulerDiscrete, etc.) convert cumulative
+                # products to numpy inside set_timesteps. Their buffers must be
+                # on CPU for that call even when step() runs on the GPU.
+                _move_scheduler(scheduler_self, "cpu")
                 result = original_set_timesteps_func(scheduler_self, **kw)
                 _move_scheduler(scheduler_self, device)
 
@@ -971,6 +1000,19 @@ class WeeBasePipeline:
         try:
             vae = getattr(pipeline, "vae", None)
             if vae is not None:
+                # Diffusers calls `latents.to(get_module_execution_device(vae))`
+                # before decode. That helper falls back to the first parameter's
+                # device, which is "meta" for a streamed VAE (encoder/blocks are
+                # lazily materialised). `ModelMixin.device` is a read-only
+                # property, so provide the hint the helper checks instead:
+                # an `_hf_hook` carrying the real execution device.
+                try:
+                    import types as _types
+                    vae._hf_hook = _types.SimpleNamespace(
+                        execution_device=torch.device(device)
+                    )
+                except Exception:
+                    pass
                 _is_video_vae = hasattr(vae, "use_framewise_decoding")
                 if _is_video_vae:
                     # ── Video VAE (e.g. AutoencoderKLLTX2Video) ──────────────

@@ -72,6 +72,7 @@ class BaseTransformerStreamer(ABC):
 
     _global_vram_budget_gb: Optional[float] = None
     _global_ram_budget_gb: Optional[float] = None
+    _global_prefetch_depth: Optional[int] = None
     _estimated_vram_overhead_bytes: int = 0
     _estimated_ram_overhead_bytes: int = 0
 
@@ -94,11 +95,21 @@ class BaseTransformerStreamer(ABC):
         #   "cuda" → directly to VRAM (only if VRAM budget allows a 2nd block)
         self.prefetch_device: str = prefetch_device if prefetch_device else "cpu"
 
+        # Quantized/stored bytes are staged in RAM; dequantization happens on
+        # the GPU in the H2D worker (GGUF / INT8 packs).
+        self._staged_prefetch: bool = bool(
+            prefetch and getattr(seeker, "supports_staged_prefetch", False)
+        )
+        # Per-block synchronize() calls are debugging aids only; keep them off
+        # unless verbose logging is enabled.
+        self._debug_timing: bool = logger.isEnabledFor(logging.DEBUG)
+
         # Build the ordered list of (shard_name, block_module) tuples.
         self._shard_order: List[Tuple[str, nn.Module]] = self._get_shard_order()
         self._shard_name_to_pos: Dict[str, int] = {
             name: idx for idx, (name, _) in enumerate(self._shard_order)
         }
+        self._max_block_bytes: int = self._compute_max_block_bytes()
 
         # ----------------------------------------------------------------
         # VRAM caching state (calibrated after the first full pass)
@@ -106,6 +117,9 @@ class BaseTransformerStreamer(ABC):
         self._pinned_blocks: set = set()       # blocks permanently in VRAM
         self._cache_budget_bytes: int = 0      # remaining VRAM budget for pinning
         self._calibration_done: bool = False
+        # First shard position that will not fit in VRAM; its stored bytes
+        # are the ones worth keeping in the host-RAM cache.
+        self._cache_from_pos: int = 0
 
         # ----------------------------------------------------------------
         # Adaptive prefetch depth
@@ -152,9 +166,8 @@ class BaseTransformerStreamer(ABC):
             for pos in range(self._prefetch_depth + 1):
                 if pos < len(self._shard_order):
                     b_name, _ = self._shard_order[pos]
-                    b_keys = self._get_layer_keys(b_name)
                     self._disk_futures[b_name] = self._disk_executor.submit(
-                        self.seeker.get_tensors, b_keys, "cpu", self.dtype
+                        self._read_for_prefetch, b_name
                     )
 
             # Seed H2D for block[0] so it is already in VRAM when the first forward
@@ -210,14 +223,20 @@ class BaseTransformerStreamer(ABC):
             return 1
 
         # Compute block sizes from metadata (no disk I/O for actual tensors).
+        # For staged (quantized) prefetch the RAM footprint is the stored size,
+        # not the dequantized size, so much deeper pipelines fit.
         try:
             block_bytes = {
-                name: self.seeker.get_block_bytes(self._get_layer_keys(name))
+                name: self._block_bytes(name, raw=self._staged_prefetch)
                 for name, _ in self._shard_order
             }
             max_block_bytes = max(block_bytes.values(), default=1)
         except Exception:
             logger.debug("[Streamer] Could not compute block sizes; defaulting prefetch_depth=1")
+            return 1
+
+        if max_block_bytes <= 0:
+            logger.debug("[Streamer] Block sizes unknown; defaulting prefetch_depth=1")
             return 1
 
         if self.prefetch_device != "cpu":
@@ -238,11 +257,16 @@ class BaseTransformerStreamer(ABC):
             
             estimated_ram_overhead = getattr(self.__class__, "_estimated_ram_overhead_bytes", 0)
             from weellm.io.utils import host_ram_caps
-            _max_depth, _safety = host_ram_caps()
+            _max_depth, _safety = host_ram_caps(staged=self._staged_prefetch)
             usable = max(0, available - max(_RAM_SAFETY_BYTES, _safety) - estimated_ram_overhead)
             depth = max(1, min(_MAX_PREFETCH_DEPTH, _max_depth, int(usable // max_block_bytes)))
         except ImportError:
             depth = 1
+
+        override = getattr(self.__class__, "_global_prefetch_depth", None)
+        if override is not None:
+            depth = max(1, min(_MAX_PREFETCH_DEPTH, int(override)))
+            logger.info("[Streamer] Prefetch depth overridden by CLI: %d", depth)
 
         logger.info(
             "[Streamer] Adaptive prefetch depth: %d  "
@@ -253,6 +277,44 @@ class BaseTransformerStreamer(ABC):
             estimated_ram_overhead / 1e9 if 'estimated_ram_overhead' in dir() else 0,
         )
         return depth
+
+    def _block_bytes(self, shard_name: str, raw: bool = False) -> int:
+        """Block footprint from header metadata. ``raw=True`` = stored bytes."""
+        keys = self._get_layer_keys(shard_name)
+        if raw:
+            try:
+                return self.seeker.get_block_bytes(keys, raw=True)
+            except TypeError:
+                pass
+        return self.seeker.get_block_bytes(keys)
+
+    def _compute_max_block_bytes(self) -> int:
+        try:
+            return max(
+                (self._block_bytes(name) for name, _ in self._shard_order),
+                default=0,
+            )
+        except Exception:
+            return 0
+
+    def _should_cache_block(self, shard_name: str) -> bool:
+        """True for blocks that will stream (not pin) and are re-read each step."""
+        if not self._calibration_done:
+            return False
+        return self._shard_name_to_pos.get(shard_name, 0) >= self._cache_from_pos
+
+    def _read_for_prefetch(self, shard_name: str):
+        """Read one block for staging (RAM). Staged seekers return raw bytes."""
+        keys = self._get_layer_keys(shard_name)
+        use_cache = self._should_cache_block(shard_name)
+        if self._staged_prefetch:
+            return self.seeker.get_staged(keys, use_cache=use_cache)
+        try:
+            return self.seeker.get_tensors(
+                keys, device="cpu", dtype=self.dtype, use_cache=use_cache
+            )
+        except TypeError:
+            return self.seeker.get_tensors(keys, device="cpu", dtype=self.dtype)
 
     def release_cached_blocks(self) -> int:
         """Release streamed VRAM blocks after an allocation failure.
@@ -369,11 +431,19 @@ class BaseTransformerStreamer(ABC):
         sd = fut.result() if fut is not None else None
         
         if sd is None:
-            sd = self.seeker.get_tensors(layer_keys, device="cpu", dtype=self.dtype)
+            sd = self._read_for_prefetch(shard_name)
             
         if sd is None:
             return None
-            
+
+        if self._staged_prefetch:
+            # Quantized bytes are already staged in RAM; upload + dequantize
+            # on the H2D stream so it overlaps the current block's compute.
+            if self._h2d_stream is not None:
+                with torch.cuda.stream(self._h2d_stream):
+                    return self.seeker.resolve_staged(sd, self.device, self.dtype)
+            return self.seeker.resolve_staged(sd, self.device, self.dtype)
+
         new_sd = {}
         if self._h2d_stream is not None:
             with torch.cuda.stream(self._h2d_stream):
@@ -434,7 +504,14 @@ class BaseTransformerStreamer(ABC):
                 elif disk_fut is not None:
                     cpu_sd = disk_fut.result()
                     if cpu_sd is not None:
-                        sd = {k: v.to(self.device) for k, v in cpu_sd.items()}
+                        if self._staged_prefetch:
+                            if self._h2d_stream is not None:
+                                with torch.cuda.stream(self._h2d_stream):
+                                    sd = self.seeker.resolve_staged(cpu_sd, self.device, self.dtype)
+                            else:
+                                sd = self.seeker.resolve_staged(cpu_sd, self.device, self.dtype)
+                        else:
+                            sd = {k: v.to(self.device) for k, v in cpu_sd.items()}
 
             if sd is None:
                 # Sync fallback: read directly to VRAM
@@ -448,18 +525,33 @@ class BaseTransformerStreamer(ABC):
                 torch.cuda.current_stream().wait_stream(self._h2d_stream)
                 
             self.apply_state_dict(sd)
-            torch.cuda.synchronize()       # flush CUDA copy_ ops from place_tensors
+            if self._h2d_stream is not None:
+                # The blocks were allocated on the H2D stream; mark them as used
+                # by the main stream so the allocator does not recycle them
+                # before the copies above have executed.
+                _main_stream = torch.cuda.current_stream(self.device)
+                for _t in sd.values():
+                    if isinstance(_t, torch.Tensor) and _t.is_cuda:
+                        _t.record_stream(_main_stream)
+            if self._debug_timing:
+                torch.cuda.synchronize()   # timing only; same-stream order is already safe
             del sd
 
         t2 = time.time()
 
         _slow = (t1 - t0) > 60.0
-        logger.info(
-            "    [Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs%s",
-            shard_name, pos + 1, len(self._shard_order), t1 - t0, t2 - t1,
-            "  <-- SLOW BLOCK (over 60s load; still alive, just slow)" if _slow else "",
-        )
-        setattr(module, "_weellm_t_compute_start", time.time())
+        if _slow:
+            logger.warning(
+                "    [Streamer] %s (%d/%d) slow load: Disk/Wait=%.1fs | H2D+Apply=%.1fs",
+                shard_name, pos + 1, len(self._shard_order), t1 - t0, t2 - t1,
+            )
+        else:
+            logger.debug(
+                "    [Streamer] %s (%d/%d): Disk/Wait=%.3fs | H2D+Apply=%.3fs",
+                shard_name, pos + 1, len(self._shard_order), t1 - t0, t2 - t1,
+            )
+        if self._debug_timing:
+            setattr(module, "_weellm_t_compute_start", time.time())
 
         # ------------------------------------------------------------------
         # Clamp float16 inputs to prevent softmax overflow.
@@ -501,9 +593,8 @@ class BaseTransformerStreamer(ABC):
                     continue
                 with self._lock:
                     if ahead_name not in self._disk_futures:
-                        akeys = self._get_layer_keys(ahead_name)
                         self._disk_futures[ahead_name] = self._disk_executor.submit(
-                            self.seeker.get_tensors, akeys, "cpu", self.dtype
+                            self._read_for_prefetch, ahead_name
                         )
 
         return args
@@ -513,11 +604,14 @@ class BaseTransformerStreamer(ABC):
     # ------------------------------------------------------------------
 
     def _post_hook(self, module: nn.Module, args, output):
-        torch.cuda.synchronize()
+        if self._debug_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
         t_end  = time.time()
         t_start = getattr(module, "_weellm_t_compute_start", t_end)
         shard_name = getattr(module, _SHARD_NAME_ATTR)
-        logger.debug("    [Streamer] %s: GPU Compute=%.3fs (Offloading...)", shard_name, t_end - t_start)
+        pos = self._shard_name_to_pos[shard_name]
+        if self._debug_timing:
+            logger.debug("    [Streamer] %s: GPU Compute=%.3fs (Offloading...)", shard_name, t_end - t_start)
 
         should_evict = True
 
@@ -572,58 +666,30 @@ class BaseTransformerStreamer(ABC):
                                 )
 
         # ------------------------------------------------------------------
-        # VRAM pinning calibration pass (first full pass only).
-        # At the end of the first pass, measure peak VRAM reserved and derive
-        # how many blocks we can permanently pin for free.
+        # VRAM pin-budget calibration (end of block 0).
+        # Calibrating after the first block instead of after the first full
+        # sweep means blocks 1..N can already stay resident for step 2, which
+        # matters a lot for short (4-8 step) video schedules.
         # ------------------------------------------------------------------
-        if not self._calibration_done:
-            if shard_name == self._shard_order[-1][0] and torch.cuda.is_available():
-                max_reserved = torch.cuda.max_memory_reserved(self.device)
-                current_allocated = torch.cuda.memory_allocated(self.device)
-                current_reserved = torch.cuda.memory_reserved(self.device)
-                global_vram_budget_gb = getattr(self.__class__, "_global_vram_budget_gb", None)
-                if global_vram_budget_gb is not None:
-                    total_vram = global_vram_budget_gb * 1024**3
-                    non_pytorch_vram = 0
-                    fragmentation_margin = 0
-                else:
-                    free_vram, total_vram = torch.cuda.mem_get_info(self.device)
-                    non_pytorch_vram = max(
-                        0,
-                        total_vram - free_vram - torch.cuda.memory_reserved(self.device),
-                    )
-                    # When hitting the physical limits of the GPU, PyTorch requires a buffer 
-                    # to allocate new segments because of memory fragmentation.
-                    fragmentation_margin = 1024**3  # 1 GB
-
-                allocator_slack = max(0, current_reserved - current_allocated)
-                estimated_overhead = getattr(self.__class__, "_estimated_vram_overhead_bytes", 0)
-                runtime_headroom = non_pytorch_vram + allocator_slack + fragmentation_margin + estimated_overhead
-                self._cache_budget_bytes = max(
-                    0, total_vram - max_reserved - runtime_headroom
-                )
-                self._calibration_done = True
-                predicted_peak = max_reserved + self._cache_budget_bytes
-                logger.debug(
-                    "    [Streamer] VRAM calibration done: peak_reserved=%.2f GB, "
-                    "total=%.2f GB, non_pytorch=%.2f GB, allocator_slack=%.2f GB, "
-                    "pin_budget=%.2f GB, "
-                    "predicted_pinned_peak=%.2f GB",
-                    max_reserved / 1e9, total_vram / 1e9,
-                    non_pytorch_vram / 1e9, allocator_slack / 1e9,
-                    self._cache_budget_bytes / 1e9,
-                    predicted_peak / 1e9,
-                )
+        if not self._calibration_done and pos == 0 and torch.cuda.is_available():
+            max_reserved, total_vram = self._calibrate_pin_budget()
+            logger.info(
+                "    [Streamer] Pin budget calibrated after block 0: %.2f GB "
+                "(peak_reserved=%.2f GB, total=%.2f GB)",
+                self._cache_budget_bytes / 1e9,
+                max_reserved / 1e9,
+                total_vram / 1e9,
+            )
 
         # ------------------------------------------------------------------
         # VRAM pinning (after calibration).
         # Greedily keep blocks in VRAM if budget allows — eliminates disk I/O
         # for those blocks on all future inference steps.
         # ------------------------------------------------------------------
-        else:
+        if self._calibration_done:
             if shard_name in self._pinned_blocks:
                 should_evict = False
-            elif self._cache_budget_bytes > 0:
+            else:
                 block_size = sum(
                     p.numel() * p.element_size()
                     for p in module.parameters()
@@ -637,11 +703,82 @@ class BaseTransformerStreamer(ABC):
                         "    [Streamer] Pinned %s to VRAM — remaining budget: %.2f GB",
                         shard_name, self._cache_budget_bytes / 1e9,
                     )
+                else:
+                    # First block that does not fit marks the streaming region;
+                    # only stored bytes from here on are worth RAM-caching.
+                    self._cache_from_pos = min(self._cache_from_pos, pos)
 
         if should_evict:
             evict_module(module)
 
         return output
+
+    # ------------------------------------------------------------------
+    # VRAM pin-budget calibration
+    # ------------------------------------------------------------------
+
+    def _calibrate_pin_budget(self):
+        """Derive how much VRAM can hold persistent blocks after block 0.
+
+        Returns ``(max_reserved, total_vram)`` for logging. A full block is
+        reserved for the double-buffer H2D transfer, one safety margin for
+        allocator/fragmentation overhead, and the physical non-PyTorch VRAM
+        when no explicit budget is configured.
+        """
+        max_reserved = torch.cuda.max_memory_reserved(self.device)
+        current_allocated = torch.cuda.memory_allocated(self.device)
+        current_reserved = torch.cuda.memory_reserved(self.device)
+
+        global_vram_budget_gb = getattr(self.__class__, "_global_vram_budget_gb", None)
+        if global_vram_budget_gb is not None:
+            total_vram = global_vram_budget_gb * 1024**3
+            non_pytorch_vram = 0
+            fragmentation_margin = 0
+        else:
+            free_vram, total_vram = torch.cuda.mem_get_info(self.device)
+            non_pytorch_vram = max(0, total_vram - free_vram - current_reserved)
+            # PyTorch needs spare segments for new allocations at the physical limit.
+            fragmentation_margin = 1024**3
+
+        allocator_slack = max(0, current_reserved - current_allocated)
+        estimated_overhead = getattr(self.__class__, "_estimated_vram_overhead_bytes", 0)
+        runtime_headroom = (
+            non_pytorch_vram
+            + allocator_slack
+            + fragmentation_margin
+            + estimated_overhead
+            + _VRAM_SAFETY_BYTES
+            + self._max_block_bytes
+        )
+        self._cache_budget_bytes = max(0, total_vram - max_reserved - runtime_headroom)
+        self._calibration_done = True
+
+        # Blocks that fit in VRAM are pinned; the rest stream every step and
+        # are the only ones worth caching in host RAM. The boundary is set
+        # dynamically by the pin loop (first block that does not fit), which
+        # uses the real module size at compute dtype.
+        self._cache_from_pos = len(self._shard_order)
+
+        # Prompt-encoding streamers run before sampling; their blocks would
+        # otherwise fill the cache budget. Start sampling with a clean cache.
+        try:
+            from weellm.io.ram_cache import get_raw_cache
+            get_raw_cache().clear()
+        except Exception:
+            pass
+
+        logger.debug(
+            "    [Streamer] Pin calibration: peak_reserved=%.2f GB, total=%.2f GB, "
+            "non_pytorch=%.2f GB, allocator_slack=%.2f GB, db_reserve=%.2f GB, "
+            "pin_budget=%.2f GB",
+            max_reserved / 1e9,
+            total_vram / 1e9,
+            non_pytorch_vram / 1e9,
+            allocator_slack / 1e9,
+            self._max_block_bytes / 1e9,
+            self._cache_budget_bytes / 1e9,
+        )
+        return max_reserved, total_vram
 
     # ------------------------------------------------------------------
     # Common from_pretrained helper

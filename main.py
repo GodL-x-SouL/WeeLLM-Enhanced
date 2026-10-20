@@ -107,9 +107,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=-1, help="Random seed (default: -1 for random)")
     parser.add_argument(
-        "--dtype", type=str, default="bfloat16",
-        choices=["bfloat16", "float16", "float32"],
-        help="Compute dtype (default: bfloat16)",
+        "--dtype", type=str, default="auto",
+        choices=["auto", "bfloat16", "float16", "float32"],
+        help="Compute dtype (default: auto — float16 on pre-Ampere GPUs like T4, bfloat16 otherwise)",
     )
     
     # Image-to-Image / Editing
@@ -150,6 +150,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache_to_ram", action="store_true",
         help="Load safetensors into CPU RAM instead of streaming from disk (faster on Kaggle/Colab)",
+    )
+    parser.add_argument(
+        "--ram_cache_gb", type=float, default=None,
+        help="Budget for the shared raw-block RAM cache in GB (quantized/stored bytes only). "
+             "Default: ~2 GB on <16 GB hosts, disabled on bigger hosts. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--prefetch_depth", type=int, default=None,
+        help="Override the number of blocks prefetched ahead (1-6). Default: adaptive.",
     )
     parser.add_argument(
         "--vram_budget", type=float, default=None,
@@ -196,17 +205,6 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = _build_parser()
     args   = parser.parse_args()
-
-    # Automatically disable prefetch for GGUF models to prevent GPU contention during dequantization
-    is_gguf = (args.transformer and str(args.transformer).lower().endswith('.gguf')) or \
-              (args.text_encoder and str(args.text_encoder).lower().endswith('.gguf')) or \
-              (args.text_encoder_2 and str(args.text_encoder_2).lower().endswith('.gguf')) or \
-              (args.text_encoder_3 and str(args.text_encoder_3).lower().endswith('.gguf')) or \
-              (args.text_encoder_4 and str(args.text_encoder_4).lower().endswith('.gguf')) or \
-              (args.model and str(args.model).lower().endswith('.gguf'))
-    if is_gguf and not args.no_prefetch:
-        print("\n[WeeLLM] Auto-routing to --no_prefetch mode because GGUF models require GPU dequantization.")
-        args.no_prefetch = True
 
     import os
     import json
@@ -258,7 +256,17 @@ def main() -> int:
 
     # ── Device & dtype ───────────────────────────────────────────────────────
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype  = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
+    if args.dtype == "auto":
+        # Turing (T4) has no fast bfloat16 path; float16 uses its tensor cores.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] < 8:
+            dtype = torch.float16
+            dtype_label = "float16 (auto)"
+        else:
+            dtype = torch.bfloat16
+            dtype_label = "bfloat16 (auto)"
+    else:
+        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
+        dtype_label = args.dtype
 
     # ── Header ──────────────────────────────────────────────────────────────
     sep = "=" * 60
@@ -274,7 +282,7 @@ def main() -> int:
         "  Steps:    %d  |  Guidance: %s  |  Seed: %s",
         args.steps, args.guidance_scale, args.seed,
     )
-    logger.info("  Dtype:    %s  |  Device: %s", args.dtype, device)
+    logger.info("  Dtype:    %s  |  Device: %s", dtype_label, device)
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         logger.info("  GPU:      %s (%.1f GB VRAM)", props.name, props.total_memory / 1e9)
@@ -352,6 +360,8 @@ def main() -> int:
             torch_dtype=dtype,
             prefetch=not args.no_prefetch,
             cache_to_ram=args.cache_to_ram,
+            ram_cache_gb=args.ram_cache_gb,
+            prefetch_depth=args.prefetch_depth,
             vae_tile_size=getattr(args, "vae_tile_size", 256),
             **kwargs
         )

@@ -41,20 +41,21 @@ def clean_memory(device: str = "cuda") -> None:
     gc.collect()
 
 
-def host_ram_caps() -> tuple:
+def host_ram_caps(staged: bool = False) -> tuple:
     """Prefetch (max_depth, safety_bytes) suited to this host's RAM.
 
     Multiple streamers (connectors + text encoder + transformer) compute
     prefetch depth INDEPENDENTLY, so on small hosts (free Colab: ~13 GB)
     their in-flight blocks add up and kill the session. On hosts below
-    16 GB total RAM we cap depth at 2 and reserve a quarter of RAM; bigger
-    hosts keep the historical (6, 2 GB) behaviour.
+    16 GB total RAM we cap depth at 2 (3 when blocks are staged as stored
+    bytes, which are ~2-4x smaller than dequantized tensors) and reserve a
+    quarter of RAM; bigger hosts keep (6, 2 GB).
     """
     try:
         import psutil
         total = psutil.virtual_memory().total
         if total < 16 * 1024**3:
-            return 2, max(2 * 1024**3, int(total * 0.25))
+            return (3 if staged else 2), max(2 * 1024**3, int(total * 0.25))
         return 6, 2 * 1024**3
     except ImportError:
         return 1, 2 * 1024**3

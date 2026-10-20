@@ -34,6 +34,7 @@ from weellm.io.comfy_quant import (
     dequantize_w4a8,
     strip_comfy_prefix,
 )
+from weellm.io.ram_cache import get_raw_cache
 from weellm.io.safetensors.safetensors_base import DTYPE_MAP, SafetensorsBase
 
 logger = logging.getLogger("weellm")
@@ -42,9 +43,13 @@ logger = logging.getLogger("weellm")
 class ComfyQuantSeeker(SafetensorsBase):
     """Disk-based reader with on-the-fly INT8/W4A8 dequantization."""
 
+    # Enables quantized-bytes RAM staging + GPU dequant in the H2D worker.
+    supports_staged_prefetch = True
+
     def __init__(self, model_dir: Union[str, Path]):
         super().__init__(model_dir)
         self._parse_index()
+        self._cache_ns = id(self)
         # Normalize Comfy single-file prefixes (model.diffusion_model.*) to
         # the diffusers namespace streamers match on. _raw_map translates
         # logical keys back to on-disk names for reading.
@@ -202,9 +207,22 @@ class ComfyQuantSeeker(SafetensorsBase):
         """Logical (diffusers-namespace) key -> on-disk safetensors key."""
         return self._raw_map.get(key, key)
 
-    def _read_raw(self, header: dict, data_base: int, filepath: Path, key: str) -> torch.Tensor:
+    def _read_raw(
+        self,
+        header: dict,
+        data_base: int,
+        filepath: Path,
+        key: str,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
         """Read one raw tensor (no dtype cast) from an open header context."""
-        meta = header[self._raw(key)]
+        raw_key = self._raw(key)
+        cache = get_raw_cache()
+        cached = cache.get(self._cache_ns, raw_key) if use_cache else None
+        if cached is not None:
+            return cached
+
+        meta = header[raw_key]
         dtype_str, shape = meta["dtype"], meta["shape"]
         start, _ = meta["data_offsets"]
         np_dtype = DTYPE_MAP[dtype_str]
@@ -225,14 +243,22 @@ class ComfyQuantSeeker(SafetensorsBase):
             t = t.view(torch.bfloat16)
         elif dtype_str == "F8_E4M3":
             t = t.view(torch.float8_e4m3fn)
+        if use_cache:
+            cache.put(self._cache_ns, raw_key, t)
         return t
 
-    def _load_piece(self, spec: dict, role: str, default_file: str) -> torch.Tensor:
+    def _load_piece(
+        self,
+        spec: dict,
+        role: str,
+        default_file: str,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
         """Read one raw tensor of a quant group, following cross-shard files."""
         piece_key = spec[role]
         src = spec["file"] if role == "weight" else spec.get(role + "_file", default_file)
         header, data_base = self._read_header(self.model_dir / src)
-        return self._read_raw(header, data_base, self.model_dir / src, piece_key)
+        return self._read_raw(header, data_base, self.model_dir / src, piece_key, use_cache=use_cache)
 
     def _logical_shape(self, key: str) -> tuple:
         spec = self.groups[key]
@@ -319,8 +345,126 @@ class ComfyQuantSeeker(SafetensorsBase):
                 result[key] = t.to(device=device)
         return result
 
-    def get_block_bytes(self, keys: List[str]) -> int:
+    # ------------------------------------------------------------------
+    # Staged prefetch: raw bytes to CPU RAM, dequant on GPU in the H2D worker
+    # ------------------------------------------------------------------
+
+    def _plain_raw(self, key: str, use_cache: bool = True) -> torch.Tensor:
+        src_file = self.weight_map[key]
+        header, data_base = self._read_header(self.model_dir / src_file)
+        return self._read_raw(header, data_base, self.model_dir / src_file, key, use_cache=use_cache)
+
+    def get_staged(self, keys: List[str], use_cache: bool = True) -> Dict[str, Tuple]:
+        """Read stored bytes only — no dequantization, no GPU work."""
+        staged: Dict[str, Tuple] = {}
+        for key in keys:
+            if key not in self.weight_map:
+                raise KeyError(f"Tensor '{key}' not found in model index.")
+            spec = self.groups.get(key)
+            if spec is None:
+                staged[key] = ("plain", self._plain_raw(key, use_cache=use_cache))
+                continue
+            pieces = {
+                "weight": self._load_piece(
+                    spec, "weight", self.weight_map[key], use_cache=use_cache
+                )
+            }
+            for role in ("s_rel", "s_channel", "codebook", "scale"):
+                if spec.get(role):
+                    try:
+                        pieces[role] = self._load_piece(
+                            spec, role, self.weight_map[key], use_cache=use_cache
+                        )
+                    except (KeyError, ValueError):
+                        pieces[role] = None
+            staged[key] = ("quant", spec, pieces)
+        return staged
+
+    def resolve_staged(
+        self,
+        staged: Dict[str, Tuple],
+        device: str = "cuda",
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Upload raw bytes and dequantize on *device* (call inside H2D stream)."""
+        target = dtype if dtype is not None else torch.bfloat16
+        result: Dict[str, torch.Tensor] = {}
+        for key, payload in staged.items():
+            if payload[0] == "plain":
+                t = payload[1].to(device=device)
+                if t.is_floating_point() and t.dtype != target:
+                    t = t.to(dtype=target)
+                result[key] = t
+                continue
+
+            _, spec, pieces = payload
+            q = pieces["weight"].to(device=device)
+            if spec["kind"] == "w4a8":
+                s_rel = pieces["s_rel"].to(device=device)
+                if s_rel.dtype == torch.uint8:
+                    s_rel = s_rel.view(torch.float8_e4m3fn)
+                s_ch = pieces["s_channel"].to(device=device)
+                cb = pieces["codebook"]
+                cb = cb.to(device=device) if cb is not None else None
+                t = dequantize_w4a8(
+                    q,
+                    s_rel.float() if s_rel.dtype == torch.float8_e4m3fn else s_rel,
+                    s_ch,
+                    codebook=cb,
+                    group_size=spec.get("group_size", 16),
+                    convrot_groupsize=spec.get("convrot_groupsize", 256),
+                    dtype=target,
+                )
+            elif spec["kind"] == "int4":
+                sc = pieces["scale"].to(device=device)
+                t = dequantize_int4(
+                    q,
+                    sc,
+                    convrot_groupsize=spec.get("convrot_groupsize", 256),
+                    quant_group_size=spec.get("quant_group_size", 64),
+                    dtype=target,
+                )
+            else:  # int8
+                sc = pieces["scale"].to(device=device)
+                t = dequantize_int8(
+                    q,
+                    sc,
+                    convrot=spec.get("convrot", False),
+                    convrot_groupsize=spec.get("convrot_groupsize", 256),
+                    dtype=target,
+                )
+            result[key] = t
+        return result
+
+    def _raw_bytes_for(self, src_file: str, key: str) -> int:
+        header, _ = self._read_header(self.model_dir / src_file)
+        meta = header[self._raw(key)]
+        shape = meta.get("shape", [])
+        dstr = meta.get("dtype", "F32")
+        count = int(np.prod(shape)) if shape else 1
+        return count * np.dtype(DTYPE_MAP[dstr]).itemsize
+
+    def staged_block_bytes(self, keys: List[str]) -> int:
+        total = 0
+        for key in keys:
+            spec = self.groups.get(key)
+            if spec is None:
+                src = self.weight_map.get(key)
+                if src:
+                    total += self._raw_bytes_for(src, key)
+                continue
+            total += self._raw_bytes_for(spec["file"], spec["weight"])
+            for role in ("s_rel", "s_channel", "codebook", "scale"):
+                if spec.get(role):
+                    total += self._raw_bytes_for(
+                        spec.get(role + "_file", spec["file"]), spec[role]
+                    )
+        return total
+
+    def get_block_bytes(self, keys: List[str], raw: bool = False) -> int:
         """Logical (dequantized, bf16-equivalent) footprint for budgeting."""
+        if raw:
+            return self.staged_block_bytes(keys)
         total = 0
         for key in keys:
             if key in self.groups:
