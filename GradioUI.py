@@ -551,9 +551,43 @@ def _native_supports(pipe, name):
         return name in inspect.signature(pipe._pipeline.__call__).parameters
     except Exception:
         return False
+def _native_default(pipe, name):
+    try:
+        d = inspect.signature(pipe._pipeline.__call__).parameters[name].default
+        return None if d is inspect.Parameter.empty else d
+    except Exception:
+        return None
+def _resample_schedule(seq, n):
+    seq = [float(v) for v in seq]
+    if not seq or n <= 0:
+        return seq
+    if len(seq) == n:
+        return seq
+    if n == 1:
+        return [seq[0]]
+    last = len(seq) - 1
+    out = []
+    for i in range(n):
+        p = i * last / (n - 1)
+        lo = int(p)
+        hi = min(lo + 1, last)
+        f = p - lo
+        out.append(seq[lo] * (1 - f) + seq[hi] * f)
+    return out
 def _run_t2i(pipe, a, cb, use_cb):
     kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_inference_steps=a['steps'], seed=a['seed'])
-    if a['guid'] > 0 and _native_supports(pipe, 'guidance_scale'):
+    if _native_supports(pipe, 'guidance_schedule'):
+        # Ideogram4 defaults guidance_schedule to a fixed 48-step tuple: it clashes
+        # with an explicit guidance_scale and with any other step count, so set it
+        # explicitly instead of relying on the native default.
+        if a['guid'] > 0:
+            kw['guidance_scale'] = a['guid']
+            kw['guidance_schedule'] = None
+        else:
+            sched = _native_default(pipe, 'guidance_schedule')
+            if sched is not None:
+                kw['guidance_schedule'] = _resample_schedule(sched, a['steps'])
+    elif a['guid'] > 0 and _native_supports(pipe, 'guidance_scale'):
         kw['guidance_scale'] = a['guid']
     if a['neg'] and _native_supports(pipe, 'negative_prompt'):
         kw['negative_prompt'] = a['neg']
