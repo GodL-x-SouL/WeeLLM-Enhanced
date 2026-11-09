@@ -1117,6 +1117,9 @@ class WeeBasePipeline:
 
             report_memory("Before Text Encoder Offload")
             for te_key in te_streamers.keys():
+                release = getattr(te_streamers[te_key], "release_resident", None)
+                if callable(release):
+                    release()
                 te_mod = getattr(pipeline, te_key, None)
                 _evict_module_to_meta(te_mod, te_key)
 
@@ -1135,6 +1138,9 @@ class WeeBasePipeline:
         tr_module = getattr(pipeline, "unet", None) or getattr(pipeline, "transformer", None)
         if tr_module is not None:
             tr_module.register_forward_pre_hook(_evict_te_before_unet)
+            for streamer in te_streamers.values():
+                if hasattr(streamer, "release_resident"):
+                    streamer._weellm_tr_module = tr_module
 
         # VRAM defrag: evict transformer before lazy VAE decode
         if hasattr(pipeline, "vae") and hasattr(pipeline.vae, "decode"):

@@ -57,6 +57,8 @@ class Qwen3VLForConditionalGenerationStreamer:
         self._seeker: Optional[object] = None
         self._model: Optional[nn.Module] = None
         self._initialized = False
+        self._full_load_lang = None  # TEFullLoad for language layers
+        self._full_load_vis = None   # TEFullLoad for visual blocks
         
         self._ensure_initialized()
 
@@ -203,8 +205,64 @@ class Qwen3VLForConditionalGenerationStreamer:
                 layer.register_forward_pre_hook(self._generic_pre_hook)
                 layer.register_forward_hook(self._generic_post_hook)
 
+    def _full_load_for(self, prefix: str):
+        from weellm.models.text_encoders.full_load import TEFullLoad
+
+        is_visual = prefix.startswith("model.visual.")
+        attr = "_full_load_vis" if is_visual else "_full_load_lang"
+        fl = getattr(self, attr, None)
+        if fl is None:
+            if is_visual:
+                modules = self._model.model.visual.blocks
+                base = "model.visual.blocks."
+            else:
+                modules = self._model.model.language_model.layers
+                base = "model.language_model.layers."
+            blocks = []
+            for i, mod in enumerate(modules):
+                p = f"{base}{i}."
+                keys = [k for k in self._seeker.weight_map.keys() if k.startswith(p)]
+                blocks.append((p, keys, mod))
+            fl = TEFullLoad(
+                owner=self,
+                seeker=self._seeker,
+                device=self.device,
+                dtype=self.dtype,
+                blocks=blocks,
+                place=self._place_tensors,
+                reload_residents=self._reload_residents_if_meta,
+            )
+            setattr(self, attr, fl)
+        return fl
+
+    def _reload_residents_if_meta(self):
+        from weellm.models.text_encoders.full_load import has_meta_residents
+
+        if has_meta_residents(self._model, self._get_resident_keys(self._seeker)):
+            self._load_resident_modules()
+
+    def release_resident(self):
+        for attr in ("_full_load_lang", "_full_load_vis"):
+            fl = getattr(self, attr, None)
+            if fl is not None:
+                fl.release()
+
     def _generic_pre_hook(self, module: nn.Module, args):
         prefix = getattr(module, "_te_prefix", "")
+        fl = self._full_load_for(prefix)
+        fl.ensure_materialized()
+        if fl.active:
+            if fl.resident(prefix):
+                module._te_loaded_sd = None
+                return args
+            gpu_sd = fl.fetch(prefix)
+            if gpu_sd is None:
+                layer_keys = [k for k in self._seeker.weight_map.keys() if k.startswith(prefix)]
+                gpu_sd = self._seeker.get_tensors(layer_keys, device=self.device, dtype=self.dtype)
+            self._place_tensors(gpu_sd)
+            module._te_loaded_sd = gpu_sd
+            return args
+
         layer_keys = [k for k in self._seeker.weight_map.keys() if k.startswith(prefix)]
         gpu_sd = self._seeker.get_tensors(layer_keys, device=self.device, dtype=self.dtype)
         logger.debug(f"[Hook] Loading {len(gpu_sd)} tensors for {prefix} onto {self.device}")

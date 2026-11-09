@@ -204,7 +204,11 @@ def pin_module_to_cpu(model: nn.Module, attr_path: str) -> None:
             logger.warning("Could not find %s in %s for CPU pinning.", attr, attr_path)
             return
         mod = getattr(mod, attr)
-        
+
+    if getattr(mod, "_weellm_cpu_pinned", False):
+        return
+    mod._weellm_cpu_pinned = True
+
     original_forward = mod.forward
     
     def cpu_forward(input_ids, *args, **kwargs):

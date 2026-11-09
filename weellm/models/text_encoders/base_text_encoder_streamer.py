@@ -126,6 +126,7 @@ class BaseLazyDecoderStreamer(ABC):
 
         self._captured: Dict[int, torch.Tensor] = {}
         self._hook_handles: list = []
+        self._full_load = None  # TEFullLoad, built lazily on the first encode
 
         # Prefetch executor and future dict (idx -> Future[state_dict])
         self._executor: Optional[ThreadPoolExecutor] = None
@@ -242,12 +243,80 @@ class BaseLazyDecoderStreamer(ABC):
                 self._hook_handles.append(h_cap)
 
     # ------------------------------------------------------------------ #
+    # Full-load (resident) encode phase                                    #
+    # ------------------------------------------------------------------ #
+
+    def _build_full_load(self):
+        from weellm.models.text_encoders.full_load import TEFullLoad
+
+        layers = self._get_model_layers()
+        blocks = []
+        for idx in range(self._num_layers):
+            prefix = self._layer_prefix(idx)
+            keys = [k for k in self._seeker.weight_map if k.startswith(prefix)]
+            blocks.append((idx, keys, layers[idx]))
+        return TEFullLoad(
+            owner=self,
+            seeker=self._seeker,
+            device=self.device,
+            dtype=self.dtype,
+            blocks=blocks,
+            place=self._place_tensors,
+            reload_residents=self._reload_residents_if_meta,
+            cancel_prefetch=self._cancel_prefetch_futures,
+        )
+
+    def _reload_residents_if_meta(self) -> None:
+        from weellm.models.text_encoders.full_load import has_meta_residents
+
+        keys = [
+            k for k in self._seeker.weight_map
+            if self._resident_key_filter(k) or self._cpu_resident_key_filter(k)
+        ]
+        if has_meta_residents(self._model, keys):
+            self._load_resident_modules()
+
+    def _cancel_prefetch_futures(self) -> None:
+        with self._lock:
+            futures = list(self._prefetch_futures.values())
+            self._prefetch_futures.clear()
+        for fut in futures:
+            fut.cancel()
+
+    def release_resident(self) -> None:
+        """Free full-load VRAM/RAM residency (called before diffusion starts)."""
+        if self._full_load is not None:
+            self._full_load.release()
+
+    # ------------------------------------------------------------------ #
     # Hooks                                                                #
     # ------------------------------------------------------------------ #
 
     def _layer_pre_hook(self, module: nn.Module, args):
         idx        = module._te_layer_idx
         layer_keys = [k for k in self._seeker.weight_map if k.startswith(self._layer_prefix(idx))]
+
+        # ----------------------------------------------------------------
+        # Resident encode phase: materialize every layer once (VRAM, then
+        # RAM overflow), then serve hooks from memory instead of disk.
+        # ----------------------------------------------------------------
+        if self._full_load is None:
+            self._full_load = self._build_full_load()
+        fl = self._full_load
+        fl.ensure_materialized()
+        if fl.active:
+            if fl.resident(idx):
+                return args
+            sd = fl.fetch(idx)
+            if sd is None:
+                # Disk tier: synchronous read, no prefetch while resident.
+                sd = self._seeker.get_tensors(layer_keys, device="cpu", dtype=self.dtype)
+                sd = {k: v.to(self.device, non_blocking=True) for k, v in sd.items()}
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._place_tensors(sd)
+            del sd
+            return args
 
         t0 = time.time()
 
@@ -304,6 +373,9 @@ class BaseLazyDecoderStreamer(ABC):
                         )
 
     def _layer_post_hook(self, module: nn.Module, args, output):
+        fl = self._full_load
+        if fl is not None and fl.active and fl.resident(module._te_layer_idx):
+            return output
         evict_module(module)
         return output
 

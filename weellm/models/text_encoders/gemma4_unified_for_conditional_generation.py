@@ -23,6 +23,8 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         self.device = device
         self.dtype = dtype
         self.prefetch = prefetch
+        self._full_load = None  # TEFullLoad, built lazily on the first encode
+        self._text_config = None
         
         uses_nested = any(k.startswith("model.language_model.layers.") for k in self.seeker.weight_map)
         self.shard_prefix = "model.language_model.layers" if uses_nested else "model.layers"
@@ -85,11 +87,88 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
             layer.register_forward_pre_hook(self._pre_hook)
             layer.register_forward_hook(self._post_hook)
 
+    # -- Full-load (resident) encode phase --
+
+    def _build_full_load(self):
+        from weellm.models.text_encoders.full_load import TEFullLoad
+
+        blocks = []
+        for i, shard_name in enumerate(self._shard_order):
+            keys = [k for k in self.seeker.weight_map if k.startswith(shard_name + ".")]
+            blocks.append((shard_name, keys, self.model.layers[i]))
+        return TEFullLoad(
+            owner=self,
+            seeker=self.seeker,
+            device=self.device,
+            dtype=self.dtype,
+            blocks=blocks,
+            place=self._place_layer_sd,
+            reload_residents=self._reload_residents_if_meta,
+            cancel_prefetch=self._cancel_prefetch_futures,
+        )
+
+    def _reload_residents_if_meta(self):
+        from weellm.models.text_encoders.full_load import has_meta_residents
+
+        if has_meta_residents(self.model, self._get_resident_keys()):
+            self._load_resident_weights()
+            self._reinit_meta_buffers()
+
+    def _cancel_prefetch_futures(self):
+        with self._lock:
+            futures = list(self._prefetch_futures.values())
+            self._prefetch_futures.clear()
+        for fut in futures:
+            fut.cancel()
+
+    def release_resident(self):
+        """Free full-load VRAM/RAM residency (called before diffusion starts)."""
+        if self._full_load is not None:
+            self._full_load.release()
+
+    def _place_layer_sd(self, sd):
+        mapped_sd = {}
+        for k, v in sd.items():
+            if k.startswith("model.language_model."):
+                mapped_sd[k[len("model.language_model."):]] = v
+            elif k.startswith("model."):
+                mapped_sd[k[len("model."):]] = v
+            else:
+                mapped_sd[k] = v
+
+        for mapped_k, mapped_v in mapped_sd.items():
+            try:
+                place_tensors(self.model, {mapped_k: mapped_v}, self.device, self.dtype, skip_errors=False)
+            except Exception as e:
+                if "layer_scalar" not in mapped_k:
+                    logger.error(f"FAILED TO PLACE {mapped_k}: {repr(e)}")
+
     def _pre_hook(self, module, args):
         import time
-        t0 = time.time()
         shard_name = module._gemma_te_shard
         pos = int(shard_name.split(".")[-1])
+
+        # Resident encode phase: materialize every layer once (VRAM, then RAM
+        # overflow), then serve hooks from memory instead of disk.
+        if self._full_load is None:
+            self._full_load = self._build_full_load()
+        fl = self._full_load
+        fl.ensure_materialized()
+        if fl.active:
+            if fl.resident(shard_name):
+                return
+            sd = fl.fetch(shard_name)
+            if sd is None:
+                layer_keys = [k for k in self.seeker.weight_map if k.startswith(shard_name + ".")]
+                sd = self.seeker.get_tensors(layer_keys, device="cpu", dtype=self.dtype)
+                sd = {k: v.to(self.device, non_blocking=True) for k, v in sd.items()}
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._place_layer_sd(sd)
+            del sd
+            return
+
+        t0 = time.time()
         layer_keys = [k for k in self.seeker.weight_map if k.startswith(shard_name + ".")]
         
         fut = None
@@ -105,23 +184,9 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         
         sd = {k: v.to(self.device, non_blocking=True) for k, v in sd.items()}
         torch.cuda.synchronize()
-        
-        mapped_sd = {}
-        for k, v in sd.items():
-            if k.startswith("model.language_model."):
-                mapped_sd[k[len("model.language_model."):]] = v
-            elif k.startswith("model."):
-                mapped_sd[k[len("model."):]] = v
-            else:
-                mapped_sd[k] = v
-                
-        for mapped_k, mapped_v in mapped_sd.items():
-            try:
-                place_tensors(self.model, {mapped_k: mapped_v}, self.device, self.dtype, skip_errors=False)
-            except Exception as e:
-                if "layer_scalar" not in mapped_k:
-                    logger.error(f"FAILED TO PLACE {mapped_k}: {repr(e)}")
-        
+
+        self._place_layer_sd(sd)
+
         torch.cuda.synchronize()
         del sd
                     
@@ -149,7 +214,10 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         t_start = getattr(module, "_weellm_t_compute_start", t_end)
         shard_name = module._gemma_te_shard
         logger.info("    [TE Streamer] %s: GPU Compute=%.3fs (Offloading...)", shard_name, t_end - t_start)
-        
+
+        fl = self._full_load
+        if fl is not None and fl.active and fl.resident(shard_name):
+            return output
         evict_module(module)
         return output
 
@@ -205,18 +273,47 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
                     
         model.eval()
 
-        # Fix PyTorch meta buffers that lose their values during init_empty_weights()
+        logger.info("Step 2/3 -- Hooking streaming layers ...")
+        streamer = cls(
+            model=model,
+            seeker=seeker,
+            device=device,
+            dtype=dtype,
+            prefetch=prefetch,
+        )
+        streamer._text_config = text_config
+
         logger.info("  Re-initializing rotary embeddings and scale buffers on GPU ...")
+        streamer._reinit_meta_buffers()
+
+        logger.info("Step 3/3 -- Loading resident tensors (chunked, ~1GB at a time) ...")
+        streamer._load_resident_weights()
+
+        return streamer
+
+    def _reinit_meta_buffers(self):
+        """Recompute rotary/scale buffers left on meta by init_empty_weights().
+
+        Also runs after a diffusion pass evicted them, before the next encode.
+        """
+        model = self.model
+        device = self.device
+        text_config = self._text_config
+        if text_config is None:
+            return
+        if not any(b is not None and b.device.type == "meta" for b in model.buffers()):
+            return
+
         # 1. Re-initialize RoPE so all inv_freq buffers are calculated with real data
         model.rotary_emb = type(model.rotary_emb)(text_config).to(device)
-        
+
         # Patch rotary embedding for full_attention to use dim=512 ON DEVICE!
         # Must correctly implement 'proportional' RoPE for dim 512 to avoid NaNs on long sequences
         base = text_config.rope_parameters["full_attention"]["rope_theta"]
         head_dim = 512
         rope_proportion = text_config.rope_parameters["full_attention"]["partial_rotary_factor"]
         rope_angles = int(rope_proportion * head_dim // 2)
-        
+
         inv_freq_rotated = 1.0 / (
             base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32, device=device) / head_dim)
         )
@@ -230,13 +327,13 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
         )
         model.rotary_emb.register_buffer("full_attention_inv_freq", inv_freq, persistent=False)
         model.rotary_emb.register_buffer("full_attention_original_inv_freq", inv_freq.clone(), persistent=False)
-        
+
         # 2. Fix embed_scale which also lost its value on the meta device
         if hasattr(model.embed_tokens, "embed_scale"):
             model.embed_tokens.embed_scale = torch.tensor(
                 text_config.hidden_size**0.5, dtype=torch.float32, device=device
             )
-            
+
         # 3. For any other remaining meta buffers (e.g. padding/mask buffers), just zero them out safely
         for buf_name, buf in model.named_buffers():
             if buf is not None and buf.device.type == "meta":
@@ -245,17 +342,10 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
                 except Exception:
                     pass
 
-        logger.info("Step 2/3 -- Hooking streaming layers ...")
-        streamer = cls(
-            model=model,
-            seeker=seeker,
-            device=device,
-            dtype=dtype,
-            prefetch=prefetch,
-        )
-
-        logger.info("Step 3/3 -- Loading resident tensors (chunked, ~1GB at a time) ...")
-        resident_keys = streamer._get_resident_keys()
+    def _load_resident_weights(self):
+        model, seeker = self.model, self.seeker
+        device, dtype = self.device, self.dtype
+        resident_keys = self._get_resident_keys()
         # The 2GB embedding table is looked up once per encode: it lives in
         # CPU RAM (like the Qwen streamers do). Everything else goes to GPU.
         embed_keys = [k for k in resident_keys if "embed_tokens" in k]
@@ -308,5 +398,3 @@ class Gemma4UnifiedForConditionalGenerationStreamer:
             logger.info("[TE Streamer] embed_tokens pinned to CPU RAM (saves ~2GB VRAM).")
         except Exception as e:
             logger.warning("[TE Streamer] CPU embedding pin failed, keeping on %s: %s", device, e)
-
-        return streamer
