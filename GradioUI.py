@@ -1,5 +1,8 @@
-"""Standalone frontend preview of the WeeLLM Studio Gradio UI, extracted from WeeLLM_Studio.ipynb (cell 2). Runs without torch/GPU/weellm/Colab; engine phases are simulated so every UI state can be inspected."""
-import os, time, random, threading, inspect, html
+"""WeeLLM Studio — standalone Gradio app. With torch+GPU+weellm present (Colab/Kaggle)
+it runs the real layer-streaming engine; without them it falls back to a simulated
+preview so the frontend can be inspected locally. Notebooks launch this file via
+serve() instead of embedding the UI source."""
+import os, time, random, threading, inspect, html, gc, traceback, fnmatch, logging, shutil
 import gradio as gr
 
 # ── model registry (verbatim from the notebook) ───────────────
@@ -64,10 +67,53 @@ def _rid(url):
     for k in ('/blob/', '/tree/', '/resolve/'):
         u = u.split(k)[0]
     return u.strip('/')
-OUT_DIR = '/tmp/weellm_studio_preview'
+# ── platform + engine capability ──────────────────────────────
+_IS_KAGGLE = os.path.isdir('/kaggle') or 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+_IS_COLAB = 'COLAB_RELEASE_TAG' in os.environ or os.path.isdir('/content')
+try:
+    import torch
+    _HAS_GPU = torch.cuda.is_available()
+except Exception:
+    torch = None
+    _HAS_GPU = False
+try:
+    import weellm
+    _HAS_WEELLM = True
+except Exception:
+    _HAS_WEELLM = False
+REAL = bool(_HAS_GPU and _HAS_WEELLM)
+
+if os.environ.get('WEELLM_OUT_DIR'):
+    OUT_DIR = os.environ['WEELLM_OUT_DIR']
+elif _IS_KAGGLE:
+    OUT_DIR = '/kaggle/working/weellm_studio'
+elif _IS_COLAB:
+    OUT_DIR = '/content/weellm_studio'
+else:
+    OUT_DIR = '/tmp/weellm_studio_preview'
 os.makedirs(OUT_DIR, exist_ok=True)
 
-_AUTO_TOKEN = ''  # no Colab secrets outside Colab
+def _detect_token():
+    tok = (os.environ.get('HF_TOKEN') or '').strip()
+    if tok:
+        return tok
+    if _IS_COLAB:
+        try:
+            from google.colab import userdata
+            return (userdata.get('HF_TOKEN') or '').strip()
+        except Exception:
+            return ''
+    if _IS_KAGGLE:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            return (UserSecretsClient().get_secret('HF_TOKEN') or '').strip()
+        except Exception:
+            return ''
+    return ''
+_AUTO_TOKEN = _detect_token()
+if _AUTO_TOKEN:
+    os.environ.setdefault('HF_TOKEN', _AUTO_TOKEN)
+    os.environ.setdefault('HUGGING_FACE_HUB_TOKEN', _AUTO_TOKEN)
 
 # ── realtime log bus (feeds the in-app logs panel) ─────────────
 LOG_BUF, LOG_LOCK = [], threading.Lock()
@@ -90,7 +136,7 @@ def ustatus(msg):
 # ── helpers ────────────────────────────────────────────────────
 def _fmt_gb(n):
     return '%.1f GB' % (n / 1e9) if n >= 1e9 else '%d MB' % (n / 1e6)
-def _budgets():
+def _sim_budgets():
     return 12.5, 8.5  # preview defaults ≈ T4 runtime; no torch/psutil needed
 
 # ── minimal HTML fragments (in-app) ────────────────────────────
@@ -135,7 +181,7 @@ def _C(cls, *args, **kw):
         return cls(*args, **kw)
 
 # ── simulated engine (UI preview only — no downloads, no GPU) ──
-def do_unload():
+def _sim_do_unload():
     ustatus('model unloaded, VRAM released. (simulated)')
     return status_html('Idle — model unloaded.', 'idle')
 
@@ -150,7 +196,7 @@ def _placeholder_image(seed, w, h):
 
 _RUN_LOCK = threading.Lock()
 
-def run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+def _sim_run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
     if not _RUN_LOCK.acquire(blocking=False):
         yield status_html('Another run is already in progress — please wait for it to finish.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
         return
@@ -222,6 +268,543 @@ def _run_all_sim(task, model_key, quant, token, prompt, neg, w, h, steps, guid, 
     ustatus('done in %.0fs · seed %d (simulated)' % (dt, seed))
     gen_state.update(pct=100, txt='Generation — done in %.0fs' % dt)
     yield status_html('Done in %.0fs · seed %d · UI PREVIEW (simulated output)' % (dt, seed), 'ok'), bar_html(100, 'Download — complete'), bar_html(100, gen_state['txt']), _log_text(), gr.update(value=img, visible=img is not None), gr.skip()
+
+def _budgets():
+    import psutil
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    ram = psutil.virtual_memory().total / 1e9
+    return round(max(4.0, vram - 3.0), 1), round(max(4.0, min(10.0, ram - 4.0)), 1)
+def _hub_dir(repo):
+    from huggingface_hub import constants
+    root = os.environ.get('HF_HUB_CACHE', constants.HF_HUB_CACHE)
+    return os.path.join(root, 'models--' + repo.replace('/', '--'), 'blobs')
+_TEMP_SUFFIXES = ('.part', '.incomplete', '.lock', '.tmp')
+def _du(path):
+    t = 0
+    for dp, _dn, fn in os.walk(path):
+        for f in fn:
+            if f.startswith('tmp') or f.endswith(_TEMP_SUFFIXES):
+                continue  # in-flight transfer fragments, not real bytes yet
+            try:
+                t += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return t
+def _repo_bytes(repo, token, patterns=None, exclude=()):
+    from huggingface_hub import HfApi
+    api = HfApi()
+    try:
+        info = api.model_info(repo, token=token or None, files_metadata=True)
+    except TypeError:
+        info = api.model_info(repo, token=token or None)
+    total, n = 0, 0
+    for s in info.siblings:
+        name = s.rfilename
+        sz = getattr(s, 'size', None) or 0
+        if patterns and not any(fnmatch.fnmatch(name, p) for p in patterns):
+            continue
+        if any(fnmatch.fnmatch(name, e) for e in exclude):
+            continue
+        total += sz
+        n += 1
+    return total, n
+
+
+def _gguf_bytes(repo, filename, token):
+    return _repo_bytes(repo, token, patterns=[filename])
+def _snap73(n):
+    n = max(9, int(n))
+    k = max(0, round((n - 5) / 17))
+    return 17 * k + 5
+def _snap121(n):
+    n = max(9, int(n))
+    return max(1, ((n - 1 + 4) // 8) * 8 + 1)
+
+# ── download plan + worker (HF Hub only, real byte progress) ───
+def _cached_plan_bytes(repo, patterns, exclude, ggufs, token):
+    """Bytes of this exact plan already sitting in the local HF cache.
+
+    Reruns must not be told to need the full total again. Base repo: walk
+    only the NEWEST snapshot dir (stale revisions do not count) and sum
+    planned files, deduped by inode so shared blobs count once. Single
+    quant files: ask the Hub cache without downloading anything.
+    """
+    cached, seen = 0, set()
+
+    def _add(path):
+        nonlocal cached
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            return
+        seen.add(key)
+        cached += st.st_size
+
+    try:
+        from huggingface_hub import constants
+        root = os.environ.get("HF_HUB_CACHE", constants.HF_HUB_CACHE)
+        snap_root = os.path.join(root, "models--" + repo.replace("/", "--"), "snapshots")
+        if os.path.isdir(snap_root):
+            snaps = [os.path.join(snap_root, s) for s in os.listdir(snap_root)]
+            snaps = [s for s in snaps if os.path.isdir(s)]
+            if snaps:
+                newest = max(snaps, key=lambda s: os.path.getmtime(s))
+                for dp, _dn, fn in os.walk(newest):
+                    for f in fn:
+                        p = os.path.join(dp, f)
+                        try:
+                            rel = os.path.relpath(p, newest)
+                        except ValueError:
+                            continue
+                        if patterns and not any(fnmatch.fnmatch(rel, pat) for pat in patterns):
+                            continue
+                        if exclude and any(fnmatch.fnmatch(rel, e) for e in exclude):
+                            continue
+                        _add(p)
+    except Exception:
+        pass
+    try:
+        from huggingface_hub import hf_hub_download
+        for grepo, gfile in (ggufs or []):
+            try:
+                lp = hf_hub_download(repo_id=grepo, filename=gfile,
+                                     token=token or None, local_files_only=True)
+                _add(lp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return cached
+
+
+def plan_download(entry, quant, token):
+    repo = _rid(entry['repo_url'])
+    if entry.get('mirror_url') and not (token or '').strip():
+        repo = _rid(entry['mirror_url'])  # non-gated mirror auto-preferred without a token
+    ignore = list(entry.get('ignore', []))
+    parts, ggufs = [], []
+    if quant == 'full':
+        total, n = _repo_bytes(repo, token, patterns=entry.get('fetch_patterns'), exclude=ignore)
+        parts.append(('%s full repo (%d files)' % (repo, n), total, 'https://huggingface.co/' + repo))
+    else:
+        ignore = ignore + ['transformer/*.safetensors', 'unconditional_transformer/*.safetensors']
+        # COLAB SLIM (free-tier disk): skip weights that are never executed.
+        # - prompt_enhancer: the LTX video adapter hard-skips it (dummy part).
+        # - text_encoder weights: only when a quant encoder replaces them
+        #   (te_gguf / te_safetensors). Configs + tokenizers (*.json) still fetch.
+        if entry.get('pipe') == 'i2v':
+            ignore = ignore + ['prompt_enhancer/*.safetensors']
+        if entry.get('te_gguf') or entry.get('te_safetensors'):
+            ignore = ignore + ['text_encoder/*.safetensors', 'text_encoder_2/*.safetensors',
+                               'text_encoder_3/*.safetensors', 'text_encoder_4/*.safetensors']
+        grepo = _rid(entry['gguf_repo_url'])
+        gsize, _ = _gguf_bytes(grepo, quant, token)
+        if gsize == 0:
+            raise RuntimeError('Quant file not found on Hub: %s/%s' % (grepo, quant))
+        ggufs.append((grepo, quant))
+        base_total, _ = _repo_bytes(repo, token, patterns=entry.get('fetch_patterns'), exclude=['transformer/*.safetensors', 'unconditional_transformer/*.safetensors'] + ignore)
+        parts.append(('Base %s : encoder + VAE + configs (transformer skipped)' % repo, base_total, 'https://huggingface.co/' + repo))
+        parts.append(('Transformer ' + quant, gsize, entry['gguf_repo_url'] + '/blob/main/' + quant))
+        if entry.get('te_gguf'):
+            trepo = _rid(entry['te_gguf'][0])
+            tsize, _ = _gguf_bytes(trepo, entry['te_gguf'][1], token)
+            ggufs.append((trepo, entry['te_gguf'][1]))
+            parts.append(('Text-encoder ' + entry['te_gguf'][1].rsplit('/', 1)[-1], tsize, entry['te_gguf'][0] + '/blob/main/' + entry['te_gguf'][1]))
+        if entry.get('te_safetensors'):
+            trepo = _rid(entry['te_safetensors'][0])
+            tsize, _ = _gguf_bytes(trepo, entry['te_safetensors'][1], token)
+            if tsize == 0:
+                raise RuntimeError('Quant file not found on Hub: %s/%s' % (trepo, entry['te_safetensors'][1]))
+            ggufs.append((trepo, entry['te_safetensors'][1]))
+            parts.append(('Text-encoder ' + entry['te_safetensors'][1].rsplit('/', 1)[-1], tsize, entry['te_safetensors'][0] + '/blob/main/' + entry['te_safetensors'][1]))
+        total = sum(p[1] for p in parts)
+    _excl = list(ignore) if quant == 'full' else (['transformer/*.safetensors', 'unconditional_transformer/*.safetensors'] + ignore)
+    cached = _cached_plan_bytes(repo, entry.get('fetch_patterns'), _excl, ggufs, token)
+    need = max(0, total - cached)
+    free = shutil.disk_usage(os.path.expanduser('~/.cache/huggingface')).free
+    if need > free * 0.92:
+        raise RuntimeError('Not enough disk: need %s more (%s total, %s already cached), have %s free. Pick a smaller quant or free space.' % (_fmt_gb(need), _fmt_gb(total), _fmt_gb(cached), _fmt_gb(free)))
+    if cached > 0:
+        ustatus('preflight: %s already cached, only %s left to fetch.' % (_fmt_gb(cached), _fmt_gb(need)))
+    return dict(repo=repo, patterns=entry.get('fetch_patterns'), ignore=ignore, ggufs=ggufs, total=total, parts=parts, skipped=ignore,
+                desc=' + '.join('%s (%s)' % (p[0], _fmt_gb(p[1])) for p in parts))
+
+
+def _download_worker(plan, token, state):
+    from huggingface_hub import snapshot_download, hf_hub_download
+    try:
+        paths, before = {}, {}
+        for grepo, _gf in plan['ggufs']:
+            d = _hub_dir(grepo)
+            os.makedirs(d, exist_ok=True)
+            before[grepo] = _du(d)
+        bd = _hub_dir(plan['repo'])
+        os.makedirs(bd, exist_ok=True)
+        before[plan['repo']] = _du(bd)
+        state['phase'] = 'snapshot'
+        box, done = {}, threading.Event()
+        def _run():
+            try:
+                kw = dict(repo_id=plan['repo'], token=token or None, max_workers=8)
+                if plan['patterns']:
+                    kw['allow_patterns'] = plan['patterns']
+                if plan.get('ignore'):
+                    kw['ignore_patterns'] = plan['ignore']
+                box['snap'] = snapshot_download(**kw)
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=min(4, max(1, len(plan['ggufs'])))) as _ex:
+                    _futs = [_ex.submit(hf_hub_download, repo_id=gr, filename=gf, token=token or None) for gr, gf in plan['ggufs']]
+                    for _fu in _cf.as_completed(_futs):
+                        _fu.result()
+            except Exception as e:
+                box['error'] = e
+            finally:
+                done.set()
+        threading.Thread(target=_run, daemon=True).start()
+        while not done.is_set():
+            got = _du(bd) - before[plan['repo']]
+            for grepo, _gf in plan['ggufs']:
+                got += _du(_hub_dir(grepo)) - before[grepo]
+            state['got'] = max(0, got)
+            time.sleep(0.5)
+        if 'error' in box:
+            raise box['error']
+        state['snap'] = box.get('snap')
+        state['done'] = True
+    except Exception as e:
+        state['error'] = '%s: %s' % (type(e).__name__, str(e))
+        ustatus('download failed — ' + state['error'])
+
+# ── pipeline loader (signature-tolerant across WeeLLM classes) ─
+PIPE_CACHE = {'key': None, 'pipe': None}
+def _filtered_call(cls, model_dir, wanted):
+    sig = inspect.signature(cls.from_pretrained)
+    ps = sig.parameters
+    variadic = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in ps.values())
+    filt = {k: v for k, v in wanted.items() if (k in ps or variadic)}
+    return cls.from_pretrained(model_dir, **filt)
+def _load_worker(entry, quant, model_dir, dtype, vram_b, ram_b, state):
+    try:
+        import weellm
+        cls = getattr(weellm, PIPE_CLS[entry['pipe']])
+        kw = dict(device='cuda', torch_dtype=dtype, prefetch=(quant == 'full'), cache_to_ram=False, vae_tile_size=512, vram_budget=vram_b, ram_budget=ram_b)
+        if quant != 'full':
+            kw['transformer_path'] = '%s/%s' % (_rid(entry['gguf_repo_url']), quant)
+            kw['prefetch'] = False
+            if entry.get('te_gguf'):
+                kw['text_encoder_path'] = '%s/%s' % (_rid(entry['te_gguf'][0]), entry['te_gguf'][1])
+            if entry.get('te_safetensors'):
+                kw['text_encoder_path'] = '%s/%s' % (_rid(entry['te_safetensors'][0]), entry['te_safetensors'][1])
+        ustatus('loading %s (%s) …' % (entry['label'], quant))
+        pipe = _filtered_call(cls, model_dir, kw)
+        try:
+            pipe.set_progress_bar_config(disable=True)
+        except Exception:
+            pass
+        state['pipe'] = pipe
+        state['done'] = True
+        ustatus('pipeline ready: %s' % type(getattr(pipe, '_pipeline', pipe)).__name__)
+    except Exception as e:
+        state['error'] = '%s: %s' % (type(e).__name__, str(e))
+        ustatus('load failed — ' + state['error'])
+def do_unload():
+    if PIPE_CACHE['pipe'] is not None:
+        try:
+            del PIPE_CACHE['pipe']
+        except Exception:
+            pass
+        PIPE_CACHE.update(key=None, pipe=None)
+    gc.collect()
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    ustatus('model unloaded, VRAM released.')
+    return status_html('Idle — model unloaded.', 'idle')
+
+# ── minimal HTML fragments (in-app) ────────────────────────────
+def status_html(msg, kind='run'):
+    dot = {'run': '#e8c96a', 'ok': '#7ee2a0', 'err': '#ff9d9d', 'idle': '#8a8a95'}[kind]
+    return ("<div style='display:flex;align-items:center;gap:8px;font-size:13px;color:#c9c9d1;padding:2px 0;'>"
+            "<span style='width:7px;height:7px;border-radius:50%;background:" + dot + ";flex-shrink:0;'></span><span>" + html.escape(msg) + "</span></div>")
+def bar_html(pct, label):
+    pct = max(0.0, min(100.0, pct))
+    return ("<div style='font-size:11px;color:#8a8a95;margin:2px 0 4px;'>" + html.escape(label) + "</div>"
+            "<div style='height:4px;border-radius:2px;background:#26262e;overflow:hidden;'>"
+            "<div style='height:100%;width:" + ('%.1f' % pct) + "%;background:#c9c9d1;transition:width .3s;'></div></div>")
+
+
+# ── inference ──────────────────────────────────────────────────
+def _native_supports(pipe, name):
+    try:
+        return name in inspect.signature(pipe._pipeline.__call__).parameters
+    except Exception:
+        return False
+def _run_t2i(pipe, a, cb, use_cb):
+    kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_inference_steps=a['steps'], seed=a['seed'])
+    if a['guid'] > 0 and _native_supports(pipe, 'guidance_scale'):
+        kw['guidance_scale'] = a['guid']
+    if a['neg'] and _native_supports(pipe, 'negative_prompt'):
+        kw['negative_prompt'] = a['neg']
+    if use_cb and _native_supports(pipe, 'callback_on_step_end'):
+        kw['callback_on_step_end'] = cb
+    return pipe.generate(**kw)
+def _run_video(pipe, entry, a, cb, use_cb):
+    n = _snap73(a['frames']) if entry['pipe'] == 't2v' else _snap121(a['frames'])
+    if n != a['frames']:
+        ustatus('frames snapped %d → %d (architecture requirement)' % (a['frames'], n))
+    kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_frames=n, num_inference_steps=a['steps'], seed=a['seed'], no_cache=True)
+    if entry['pipe'] == 'i2v':
+        kw['image'] = a['start']
+    if a['guid'] > 0:
+        kw['guidance_scale'] = a['guid']
+    if use_cb:
+        kw['callback_on_step_end'] = cb
+    try:
+        return pipe(**kw), n
+    except TypeError as e:
+        if 'callback_on_step_end' in str(e):
+            ustatus('native pipeline drops step callbacks — progress will be coarse.')
+            kw.pop('callback_on_step_end', None)
+            return pipe(**kw), n
+        raise
+def _save_video_out(out, entry_label):
+    from diffusers.utils import encode_video
+    if hasattr(out, 'videos') and out.videos is not None:
+        videos = out.videos[0] if isinstance(out.videos, list) else out.videos
+    elif hasattr(out, 'video') and out.video is not None:
+        videos = out.video[0] if isinstance(out.video, list) else out.video
+    elif hasattr(out, 'frames') and out.frames is not None:
+        videos = out.frames[0] if isinstance(out.frames, list) else out.frames
+    else:
+        raise RuntimeError('Unrecognized video output from %s' % entry_label)
+    audio = getattr(out, 'audio', None)
+    if isinstance(audio, list):
+        audio = audio[0] if audio else None
+    fps = getattr(out, 'fps', None) or 24
+    path = os.path.join(OUT_DIR, 'out_%d.mp4' % int(time.time()))
+    try:
+        encode_video(videos, fps=fps, output_path=path, audio=audio, audio_sample_rate=getattr(out, 'sampling_rate', 24000))
+    except Exception:
+        import torchvision.io
+        v = videos
+        if isinstance(v, torch.Tensor):
+            if v.dim() == 4 and v.shape[0] == 3:
+                v = v.permute(1, 0, 2, 3)
+            if v.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                v = (v * 255).clamp(0, 255).to(torch.uint8)
+            torchvision.io.write_video(path, v.permute(0, 2, 3, 1), fps=24, audio_array=audio, audio_fps=24000, audio_codec='aac')
+        else:
+            raise
+    return path
+
+# ── master generator (streams status · bars · logs · media) ────
+def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+    entry = MODELS.get(model_key)
+    if entry is not None:  # Dropdown returns the label — map it back to the quant value
+        _qmap = {lbl: val for val, lbl, _u in entry['quants']}
+        quant = _qmap.get(quant, quant)
+    if entry is None or not (prompt or '').strip():
+        yield status_html('Pick a model and write a prompt first.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+        return
+    if entry['pipe'] == 'i2v' and start_img is None:
+        yield status_html('Image → Video needs a start frame image.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+        return
+    token = (token or '').strip()
+    if entry['gated'] and not token and not entry.get('mirror_url'):
+        ustatus('WARNING: %s is gated and has no mirror — a token will be required at download.' % entry['label'])
+    seed = int(seed)
+    if seed < 0:
+        seed = random.randrange(2 ** 31 - 1)
+    dtype = torch.float16 if dtype_name == 'float16' else torch.bfloat16
+    a = dict(prompt=prompt.strip(), neg=(neg or '').strip(), w=int(w), h=int(h), steps=int(steps), guid=float(guid or 0), seed=seed, frames=int(frames), start=start_img)
+    if entry.get('supported') is False:
+        _why = entry.get('unsupported_reason', 'This model cannot be loaded by WeeLLM yet.')
+        ustatus('refused — ' + _why)
+        yield status_html('Cannot run %s: %s' % (entry['label'], _why), 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+        return
+    ustatus('run: %s · %s · %dx%d · %d steps · seed %d' % (entry['label'], quant, a['w'], a['h'], a['steps'], seed))
+
+    def snap():
+        return status_html('Working — see bars and logs below', 'run'), bar_html(dl_state.get('pct', 0), dl_state.get('txt', 'Download')), bar_html(gen_state.get('pct', 0), gen_state.get('txt', 'Generation')), _log_text(), gr.skip(), gr.skip()
+
+    # — phase 1: download (HF Hub only) —
+    dl_state = {'pct': 0, 'txt': 'Download — resolving sizes…'}
+    gen_state = {'pct': 0, 'txt': 'Generation — waiting'}
+    yield snap()
+    try:
+        plan = plan_download(entry, quant, token)
+    except Exception as e:
+        _msg = str(e)
+        if '401' in _msg or 'Unauthorized' in _msg:
+            _msg += ' — this repo is gated: paste an HF token above AND click Agree/Accept on the repo page (%s).' % (_rid(entry['repo_url']))
+        ustatus('preflight failed — %s' % _msg)
+        yield status_html('Download blocked: %s' % _msg, 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+        return
+    if not plan['total']:
+        ustatus('WARNING: the Hub did not report file sizes — downloading without a progress denominator.')
+    for _plabel, _pbytes, _purl in plan['parts']:
+        ustatus('fetch plan: %s = %s <%s>' % (_plabel, _fmt_gb(_pbytes), _purl))
+    if plan.get('skipped'):
+        ustatus('skipped as assumed-unused: ' + ', '.join(plan['skipped']))
+    dl = {'got': 0, 'done': False, 'error': None, 'snap': None}
+    threading.Thread(target=_download_worker, args=(plan, token, dl), daemon=True).start()
+    _warned_over = False
+    while not dl['done'] and not dl.get('error'):
+        denom = max(plan['total'], dl['got'])  # Hub listing can lag real bytes; never show >100%
+        pct = 100.0 * min(1.0, dl['got'] / max(1, denom))
+        dl_state.update(pct=pct, txt='Download — %s / %s' % (_fmt_gb(dl['got']), _fmt_gb(denom)))
+        if not _warned_over and dl['got'] > plan['total'] and plan['total'] > 0:
+            _warned_over = True
+            ustatus('note: fetched %s vs %s planned — Hub sizes lagged; extra bytes are harmless cache, continuing.' % (_fmt_gb(dl['got']), _fmt_gb(plan['total'])))
+        yield snap()
+        time.sleep(0.4)
+    if dl.get('error'):
+        yield status_html('Download failed: %s' % dl['error'], 'err'), bar_html(dl_state['pct'], 'Download — failed'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+        return
+    dl_state.update(pct=100, txt='Download — complete (%s)' % _fmt_gb(plan['total']))
+    model_dir = dl['snap']
+    if entry.get('subfolder'):
+        model_dir = os.path.join(model_dir, entry['subfolder'])
+    ustatus('weights at %s' % model_dir)
+    yield snap()
+
+    # — phase 2: load (cached, instant on repeat runs) —
+    key = (model_key, quant, dtype_name, vram_b, ram_b)
+    if PIPE_CACHE['key'] != key or PIPE_CACHE['pipe'] is None:
+        if PIPE_CACHE['pipe'] is not None:
+            ustatus('pipeline config changed — rebuilding automatically, no manual unload needed.')
+            do_unload()
+        gen_state.update(pct=0, txt='Generation — loading pipeline…')
+        yield snap()
+        ls, _tries = {}, 0
+        while True:
+            _tries += 1
+            ls = {}
+            threading.Thread(target=_load_worker, args=(entry, quant, model_dir, dtype, vram_b, ram_b, ls), daemon=True).start()
+            while not ls.get('done') and not ls.get('error'):
+                yield snap()
+                time.sleep(0.4)
+            if ls.get('error') and 'out of memory' in ls['error'].lower() and _tries == 1:
+                ustatus('load hit CUDA OOM — purging VRAM and retrying once…')
+                do_unload()
+                continue
+            break
+        if ls.get('error'):
+            yield status_html('Load failed: %s' % ls['error'], 'err'), bar_html(100, 'Download — complete'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+            return
+        PIPE_CACHE.update(key=key, pipe=ls['pipe'])
+    else:
+        ustatus('reusing cached pipeline (sampling-only change — no rebuild needed).')
+    pipe = PIPE_CACHE['pipe']
+
+    # — phase 3: generate —
+    gstate, gbox = {'step': 0, 'total': a['steps']}, {}
+    def _cb(_p, i, _t, cb_kwargs):
+        try:
+            gstate['step'] = int(i) + 1
+        except Exception:
+            pass
+        return cb_kwargs
+    gen_state.update(pct=1, txt='Generation — denoising 0/%d' % a['steps'])
+    yield snap()
+    t0 = time.time()
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    def _infer():
+        try:
+            if entry['pipe'] == 't2i':
+                gbox['img'] = _run_t2i(pipe, a, _cb, True)
+            else:
+                out, _n = _run_video(pipe, entry, a, _cb, True)
+                gbox['vid'] = _save_video_out(out, entry['label'])
+        except Exception as e:
+            gbox['error'] = '%s: %s' % (type(e).__name__, str(e))
+            ustatus('inference failed — ' + gbox['error'])
+            ustatus(traceback.format_exc(limit=5)[-1500:])
+    threading.Thread(target=_infer, daemon=True).start()
+    while 'img' not in gbox and 'vid' not in gbox and 'error' not in gbox:
+        pct = 100.0 * min(1.0, gstate['step'] / max(1, gstate['total']))
+        gen_state.update(pct=pct, txt='Generation — denoising %d/%d' % (min(gstate['step'], gstate['total']), gstate['total']))
+        yield snap()
+        time.sleep(0.4)
+    if 'error' in gbox:
+        if 'out of memory' in gbox['error'].lower():
+            do_unload()
+            ustatus('VRAM exhausted — model unloaded automatically. Lower resolution/steps or raise the VRAM budget, then Run again.')
+        yield status_html('Generation failed: %s' % gbox['error'], 'err'), bar_html(100, 'Download — complete'), bar_html(gen_state['pct'], 'Generation — failed'), _log_text(), gr.skip(), gr.skip()
+        return
+    dt = time.time() - t0
+    try:
+        peak = torch.cuda.max_memory_allocated() / 1e9
+    except Exception:
+        peak = -1.0
+    img, vid = gbox.get('img'), gbox.get('vid')
+    _blank = False
+    if img is not None:
+        img.save(os.path.join(OUT_DIR, 'img_%d.png' % int(t0)))
+        try:
+            _ex = img.convert('RGB').getextrema()
+            _blank = all((mx - mn) == 0 for mn, mx in _ex)
+            if _blank:
+                ustatus('WARNING: output is one flat color (classic NaN black-image failure) — re-run with dtype bfloat16.')
+        except Exception:
+            pass
+    ustatus('done in %.0fs · peak %.2f GB · seed %d' % (dt, peak, seed))
+    gen_state.update(pct=100, txt='Generation — done in %.0fs' % dt)
+    _done_txt = 'Done in %.0fs · peak %.2f GB VRAM · seed %d' % (dt, peak, seed)
+    _done_kind = 'ok'
+    if _blank:
+        _done_txt += ' — WARNING: output looks blank. Re-run with dtype bfloat16.'
+        _done_kind = 'err'
+    yield status_html(_done_txt, _done_kind), bar_html(100, 'Download — complete'), bar_html(100, gen_state['txt']), _log_text(), gr.update(value=img, visible=img is not None), gr.update(value=vid, visible=vid is not None)
+
+_RUN_LOCK = threading.Lock()
+
+def run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+    # One run at a time: a second RUN click while downloading/loading would
+    # build a whole second pipeline next to the first and OOM the box.
+    if not _RUN_LOCK.acquire(blocking=False):
+        yield status_html('Another run is already in progress — please wait for it to finish.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+        return
+    try:
+        yield from _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b)
+    finally:
+        _RUN_LOCK.release()
+
+
+
+# ── bind real engine or simulated preview ─────────────────────
+if REAL:
+    class _BusHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                _push_log('%s: %s' % (record.name, record.getMessage()))
+            except Exception:
+                pass
+    for _lname in ('weellm', 'weellm.cache'):
+        _lg = logging.getLogger(_lname)
+        _lg.setLevel(logging.INFO)
+        _lg.propagate = False
+        if not any(isinstance(h, _BusHandler) for h in _lg.handlers):
+            _lg.addHandler(_BusHandler())
+else:
+    _budgets = _sim_budgets
+    do_unload = _sim_do_unload
+    run_all = _sim_run_all
 
 # ── minimal theme: one dark palette for both OS color schemes ──
 def _studio_theme():
@@ -339,9 +922,28 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
         except Exception:
             pass
 
-if __name__ == '__main__':
+def serve(share=None):
+    """Queue + launch the app and return its URL. Non-blocking so a notebook
+    cell can call this and then keep itself alive with a heartbeat."""
     try:
         demo.queue(max_size=8)
     except TypeError:
         demo.queue()
-    demo.launch(server_name='127.0.0.1', server_port=7860, share=False, show_error=True)
+    if share is None:
+        share = REAL or _IS_KAGGLE or _IS_COLAB
+    if share:
+        demo.launch(server_name='0.0.0.0', share=True, inline=False, quiet=True,
+                    prevent_thread_lock=True, show_error=False)
+    else:
+        demo.launch(server_name='127.0.0.1', server_port=7860, share=False,
+                    show_error=True, prevent_thread_lock=True)
+    return getattr(demo, 'share_url', None) or getattr(demo, 'local_url', None)
+
+if __name__ == '__main__':
+    _url = serve()
+    print(_url or 'http://127.0.0.1:7860', flush=True)
+    try:
+        while True:  # hold the process (and any hosted session) alive
+            time.sleep(60)
+    except KeyboardInterrupt:
+        pass

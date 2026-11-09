@@ -14,9 +14,10 @@ WeeLLM streams text-encoder and transformer layers to the GPU instead of forcing
 
 ## Getting started
 
-- **Colab / Kaggle** — open `WeeLLM_Studio.ipynb`, pick a GPU runtime, and run both cells.
+- **Colab** — open `WeeLLM_Studio.ipynb`, pick a GPU runtime, and run both cells.
+- **Kaggle** — open `WeeLLM_Studio_Kaggle.ipynb`, enable GPU, and run both cells; model downloads go to `/kaggle/tmp` (HF cache symlinked there) and the separate `GradioUI.py` is served as a public share URL.
 - **Local** — `pip install -r requirements.txt`, then run `python main.py --model <hf-repo> --prompt "..." --vram_budget 4 --ram_budget 4`.
-- **UI preview** — `python GradioUI.py` serves the Studio frontend locally (simulated engine) for design analysis.
+- **UI preview** — `python GradioUI.py` serves the Studio frontend locally (simulated engine when no GPU/weellm); the same file runs the real engine on Colab/Kaggle.
 
 > Streaming is optimized for local NVMe SSDs; cloud instances with restricted disk I/O will be slower. Dense autoregressive image models are impractical without quantization.
 
