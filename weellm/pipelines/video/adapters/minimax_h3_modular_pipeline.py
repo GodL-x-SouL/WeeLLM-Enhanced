@@ -47,7 +47,11 @@ class WeeMiniMaxPipeline(WeeVideoPipeline):
         kwargs.pop("negative_prompt", None)
         kwargs.pop("image_guidance_scale", None)
         kwargs.pop("_video_cache", None)
-        kwargs.pop("callback_on_step_end", None)
+        # The modular pipeline has no callback_on_step_end, but WeeLLM hooks its
+        # denoise loop and drives the studio's progress bar from there.
+        _step_cb = kwargs.pop("callback_on_step_end", None)
+        if _step_cb is not None:
+            kwargs["_weellm_step_callback"] = _step_cb
         
         # 3. Delegate to the shared generic video generation loop in the base class
         return super().__call__(prompt=prompt, **kwargs)

@@ -112,6 +112,14 @@ class LTX2VideoTransformer3DModelStreamer(BaseTransformerStreamer):
             model = LTX2VideoTransformer3DModel.from_config(config)
         model.eval()
 
+        # Key-map level structural patches (no-op for LTX today, kept for symmetry
+        # with the other GGUF-capable streamers).
+        if hasattr(seeker, "patch_model"):
+            try:
+                seeker.patch_model(model, config, device, dtype)
+            except Exception as e:
+                logger.warning("[WeeLLM] patch_model failed for the LTX transformer: %s", e)
+
         logger.info("Step 3/3 -- Loading resident transformer tensors to device=%s ...", device)
         streamer = cls(model=model, seeker=seeker, device=device, dtype=dtype, prefetch=prefetch, prefetch_device=prefetch_device)
         resident_ckpt_keys = streamer._get_resident_ckpt_keys()

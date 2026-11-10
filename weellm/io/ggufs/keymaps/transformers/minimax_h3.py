@@ -105,81 +105,22 @@ def _apply_top_level_remap(ckpt_key: str) -> str:
 
 def _build_block_entries(gguf_key: str, diffusers_key: str) -> list:
     """
-    Given a GGUF key (already top-level remapped to diffusers naming),
-    expand any sub-key renames (attn, mlp, etc.) and return a list of
-    (diffusers_name, slice_info) tuples.
+    Expand a (top-level remapped) GGUF key into (diffusers_name, slice_info) pairs.
 
-    slice_info is None or (split_idx, total_splits).
+    IMPORTANT: only the *top-level* prefix remap happens here.  Everything
+    inside a block is left in checkpoint naming on purpose:
+
+      * ``attn.qkv_proj.weight``  is stored PER-HEAD INTERLEAVED
+        ([head0: q k v, head1: q k v, ...]).  It must be reordered to
+        [q_all | k_all | v_all] before it can be split into to_q/to_k/to_v.
+      * ``mlp.fc1.weight`` stores [gate | value] while diffusers' SwiGLU reads
+        [value | gate] - the two halves have to be swapped.
+
+    Both operations need the model config (num_attention_heads /
+    attention_head_dim), which the keymap does not have -- and the streamer
+    already implements both correctly in its apply_state_dict().  So the keys are
+    passed through unchanged and the streamer does the work.
     """
-    # attn.qkv_proj.weight -> to_q.weight, to_k.weight, to_v.weight (interleaved split)
-    if diffusers_key.endswith(".attn.qkv_proj.weight"):
-        prefix = diffusers_key[: -len("qkv_proj.weight")]
-        return [
-            (prefix + "to_q.weight", (0, 3)),
-            (prefix + "to_k.weight", (1, 3)),
-            (prefix + "to_v.weight", (2, 3)),
-        ]
-    if diffusers_key.endswith(".attn.qkv_proj.bias"):
-        prefix = diffusers_key[: -len("qkv_proj.bias")]
-        return [
-            (prefix + "to_q.bias", (0, 3)),
-            (prefix + "to_k.bias", (1, 3)),
-            (prefix + "to_v.bias", (2, 3)),
-        ]
-
-    # attn.out_proj.* -> attn.to_out.0.*
-    if ".attn.out_proj." in diffusers_key:
-        return [(diffusers_key.replace(".attn.out_proj.", ".attn.to_out.0."), None)]
-
-    # attn.q_norm.* -> attn.norm_q.*
-    if ".attn.q_norm." in diffusers_key:
-        return [(diffusers_key.replace(".attn.q_norm.", ".attn.norm_q."), None)]
-
-    # attn.k_norm.* -> attn.norm_k.*
-    if ".attn.k_norm." in diffusers_key:
-        return [(diffusers_key.replace(".attn.k_norm.", ".attn.norm_k."), None)]
-
-    # mlp.fc1.* -> ff.net.0.proj.*
-    # Note: the actual gate/value swap happens in apply_state_dict, not here.
-    # The keymap just does the name rename; the streamer's apply_state_dict
-    # handles the torch chunk() + reorder.
-    if ".mlp.fc1." in diffusers_key:
-        return [(diffusers_key.replace(".mlp.fc1.", ".ff.net.0.proj."), None)]
-
-    # mlp.fc2.* -> ff.net.2.*
-    if ".mlp.fc2." in diffusers_key:
-        return [(diffusers_key.replace(".mlp.fc2.", ".ff.net.2."), None)]
-
-    # token_refiner sub-key renames
-    if "token_refiner" in diffusers_key:
-        dk = diffusers_key
-        if ".attn.out_proj." in dk:
-            dk = dk.replace(".attn.out_proj.", ".attn.to_out.0.")
-        if ".attn.q_norm." in dk:
-            dk = dk.replace(".attn.q_norm.", ".attn.norm_q.")
-        if ".attn.k_norm." in dk:
-            dk = dk.replace(".attn.k_norm.", ".attn.norm_k.")
-        if ".mlp.fc1." in dk:
-            dk = dk.replace(".mlp.fc1.", ".ff.net.0.proj.")
-        if ".mlp.fc2." in dk:
-            dk = dk.replace(".mlp.fc2.", ".ff.net.2.")
-        if "qkv_proj.weight" in dk:
-            prefix = dk[: dk.index("qkv_proj.weight")]
-            return [
-                (prefix + "to_q.weight", (0, 3)),
-                (prefix + "to_k.weight", (1, 3)),
-                (prefix + "to_v.weight", (2, 3)),
-            ]
-        if "qkv_proj.bias" in dk:
-            prefix = dk[: dk.index("qkv_proj.bias")]
-            return [
-                (prefix + "to_q.bias", (0, 3)),
-                (prefix + "to_k.bias", (1, 3)),
-                (prefix + "to_v.bias", (2, 3)),
-            ]
-        if dk != diffusers_key:
-            return [(dk, None)]
-
     return [(diffusers_key, None)]
 
 

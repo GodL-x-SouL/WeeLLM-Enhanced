@@ -219,6 +219,16 @@ class MiniMaxH3Transformer3DModelStreamer(BaseTransformerStreamer):
             model = MiniMaxH3Transformer3DModel.from_config(cfg)
         model.eval()
 
+        # The pruned GGUF stores an 8-dim AdaLN table instead of the full
+        # time-embedding MLP and has no SiLU on the patch projections.  The
+        # key-map's patch_model_before_stream() installs those replacements --
+        # without it the model keeps meta tensors and dies on the first forward.
+        if hasattr(seeker, "patch_model"):
+            try:
+                seeker.patch_model(model, cfg, device, dtype)
+            except Exception as e:
+                logger.warning("[WeeLLM] patch_model failed for the H3 transformer: %s", e)
+
         logger.info("Step 3/3 -- Loading resident transformer tensors to device=%s ...", device)
         streamer = cls(model=model, seeker=seeker, device=device, dtype=dtype, prefetch=prefetch, prefetch_device=prefetch_device)
         resident_ckpt_keys = streamer._get_resident_ckpt_keys()

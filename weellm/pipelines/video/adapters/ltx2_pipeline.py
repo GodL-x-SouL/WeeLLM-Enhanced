@@ -75,6 +75,7 @@ class WeeLTX2Pipeline(WeeVideoPipeline):
         
         # 2. Load extra LTX components if they exist
         index_path = model_dir_path / "model_index.json"
+        index = {}
         if index_path.exists():
             with open(index_path, "r", encoding="utf-8") as f:
                 index = json.load(f)

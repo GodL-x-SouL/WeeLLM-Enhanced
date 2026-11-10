@@ -34,11 +34,14 @@ MODELS = {
   ],
   default_q='ideogram4-Q4_K.gguf'),
 
- 'minimax-h3': dict(task='t2v', label='MiniMax-H3 (FL2VA) · experimental', pipe='t2v',
+ 'minimax-h3': dict(task='t2v', label='MiniMax-H3 · experimental', pipe='t2v',
   repo_url='https://huggingface.co/MiniMaxAI/MiniMax-H3', mirror_url=None, gated=False,
-  access='Open repo — experimental: pruned-GGUF path only; full weights (144 GB FL2VA) cannot fit Colab.',
+  access='Open repo — experimental: the pruned-GGUF path only (the full weights are 144 GB per variant). We use the repo ROOT layout (MiniMaxH3ModularPipeline + MiniMaxH3Transformer3DModel), which is the one WeeLLM supports.',
   gguf_repo_url='https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF',
-  te_gguf=('https://huggingface.co/DeepBeepMeep/MiniMax-H3', 'Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf'), subfolder='FL2VA', fetch_patterns=['*.json', 'FL2VA/*.json', 'FL2VA/tokenizer*', 'FL2VA/tokenizer/*', 'FL2VA/processor/*', 'FL2VA/visual_vae/*', 'FL2VA/audio_vae/*', 'FL2VA/scheduler/*', 'FL2VA/*.py', 'FL2VA/*.txt'],
+  te_gguf=('https://huggingface.co/DeepBeepMeep/MiniMax-H3', 'Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf'),
+  fetch_patterns=['model_index.json', 'transformer/*.json', 'vae/*', 'audio_vae/*',
+                  'text_encoder/config.json', 'tokenizer/*', 'processor/*',
+                  'scheduler/*', 'audio_scheduler/*', '*.txt', '*.py'],
   steps=6, guid=0.0, w=960, h=544, frames=73,
   ignore=[],
   quants=[
@@ -780,10 +783,26 @@ def _save_video_out(out, entry_label):
     audio = getattr(out, 'audio', None)
     if isinstance(audio, list):
         audio = audio[0] if audio else None
+    # The pipelines return audio as [B, channels, samples]; diffusers' writer
+    # expects [channels, samples] and would otherwise duplicate the batch
+    # (2x too long / garbled).  The sample rate also differs per model:
+    # LTX-2.5 outputs 48 kHz, MiniMax-H3 32 kHz.
+    try:
+        if hasattr(audio, 'dim') and audio.dim() == 3 and audio.shape[0] == 1:
+            audio = audio[0]
+    except Exception:
+        pass
+    _rate = getattr(out, 'sampling_rate', None)
+    if not _rate:
+        _voc = getattr(out, 'vocoder', None)
+        _cfg = getattr(_voc, 'config', None)
+        _rate = getattr(_cfg, 'output_sampling_rate', None) if _cfg is not None else None
+    if not _rate:
+        _rate = 48000 if 'LTX' in (entry_label or '') else 32000
     fps = getattr(out, 'fps', None) or 24
     path = os.path.join(OUT_DIR, 'out_%d.mp4' % int(time.time()))
     try:
-        encode_video(videos, fps=fps, output_path=path, audio=audio, audio_sample_rate=getattr(out, 'sampling_rate', 24000))
+        encode_video(videos, fps=fps, output_path=path, audio=audio, audio_sample_rate=int(_rate))
     except Exception:
         import torchvision.io
         v = videos
@@ -792,7 +811,7 @@ def _save_video_out(out, entry_label):
                 v = v.permute(1, 0, 2, 3)
             if v.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 v = (v * 255).clamp(0, 255).to(torch.uint8)
-            torchvision.io.write_video(path, v.permute(0, 2, 3, 1), fps=24, audio_array=audio, audio_fps=24000, audio_codec='aac')
+            torchvision.io.write_video(path, v.permute(0, 2, 3, 1), fps=24, audio_array=audio, audio_fps=int(_rate), audio_codec='aac')
         else:
             raise
     return path

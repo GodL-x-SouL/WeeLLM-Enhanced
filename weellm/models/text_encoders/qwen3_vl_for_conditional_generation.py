@@ -80,6 +80,15 @@ class Qwen3VLForConditionalGenerationStreamer:
             self._model = Qwen3VLForConditionalGeneration(config)
         self._model.eval()
 
+        # A GGUF text encoder stores the final norm and the RoPE inv_freq as
+        # *computed* tensors, not weights.  The key-map's patch_model_before_stream()
+        # materialises them -- without it the attention runs on a meta buffer.
+        if hasattr(self._seeker, "patch_model"):
+            try:
+                self._seeker.patch_model(self._model, config, self.device, self.dtype)
+            except Exception as e:
+                logger.warning("[WeeLLM] patch_model failed for the Qwen3-VL encoder: %s", e)
+
         # Truncate layers to match the available weights (e.g., for pruned models).
         # We leave the config layer count intact so Diffusers validation passes, 
         # but truncating the module list gracefully halts the forward loop early.

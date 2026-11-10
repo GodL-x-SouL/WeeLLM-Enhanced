@@ -173,6 +173,65 @@ class WeeVideoPipeline(WeeBasePipeline):
         os.makedirs(cache.run_dir_path, exist_ok=True)
         return cache
 
+    def _patch_denoise_loops(self, pipeline, step_callback=None, video_cache=None):
+        """Hook ``loop_step`` on a modular pipeline's denoise blocks.
+
+        The modular pipelines (MiniMax-H3) have no ``callback_on_step_end``, so
+        the studio's progress bar would never advance.  Hooking the loop lets us
+        report every step -- and lets the video cache resume from a step.
+        """
+        underlying = getattr(pipeline, "_pipeline", pipeline)
+        if not (hasattr(underlying, "_blocks") and hasattr(underlying._blocks, "sub_blocks")):
+            return
+
+        def _walk(blocks_dict):
+            for block in blocks_dict.values():
+                if hasattr(block, "loop_step") and not getattr(block, "_weellm_patched_loop", False):
+                    original_loop = getattr(block, "loop_step")
+
+                    def _hooked_loop(self_block, pipe, state, i, t, orig=original_loop):
+                        import os
+                        resume_idx = int(os.environ.get("WEELLM_RESUME_STEP", "0"))
+                        if i < resume_idx:
+                            logger.info(f"\n!!! Fast-Forwarding: Skipping Step {i} !!!")
+                            if i == resume_idx - 1:
+                                resume_path = os.environ.get("WEELLM_RESUME_PATH", "")
+                                if resume_path and os.path.exists(resume_path):
+                                    logger.info(f"!!! Injecting Latents from {resume_path} !!!\n")
+                                    import torch
+                                    cached = torch.load(resume_path, map_location="cpu")
+                                    if isinstance(cached, torch.Tensor):
+                                        state.latents = cached.to(state.latents.device)
+                                        state.noise_pred = torch.zeros_like(state.latents)
+                                    elif isinstance(cached, dict) and "latents" in cached:
+                                        state.latents = cached["latents"].to(state.latents.device)
+                                        state.noise_pred = torch.zeros_like(state.latents)
+                                        if "audio_latents" in cached and hasattr(state, "audio_latents"):
+                                            state.audio_latents = cached["audio_latents"].to(getattr(state, "audio_latents").device)
+                                    if hasattr(state, "audio_latents"):
+                                        state.audio_noise_pred = torch.zeros_like(state.audio_latents)
+                            return pipe, state
+
+                        pipe, state = orig(pipe, state, i=i, t=t)
+                        cb = step_callback
+                        if cb is None and video_cache is not None:
+                            cb = video_cache.get_step_callback()
+                        if cb is not None:
+                            latents = getattr(state, "latents", None)
+                            cb_kwargs = {"latents": latents}
+                            try:
+                                cb(pipe, i, t, cb_kwargs)
+                            except Exception:
+                                pass
+                        return pipe, state
+
+                    block.loop_step = _hooked_loop.__get__(block, block.__class__)
+                    block._weellm_patched_loop = True
+                elif hasattr(block, "sub_blocks"):
+                    _walk(block.sub_blocks)
+
+        _walk(underlying._blocks.sub_blocks)
+
     def __call__(self, **kwargs):
         """
         Generic video generation loop featuring VideoStepCache integration,
@@ -188,6 +247,13 @@ class WeeVideoPipeline(WeeBasePipeline):
         
         generator = kwargs.get("generator")
         seed = kwargs.pop("seed", generator.initial_seed() if generator is not None else 42)
+        if generator is None:
+            # The pipelines take a `generator`, not a `seed`; without this the
+            # seed was silently dropped and every run differed from the one the
+            # UI reported.
+            import torch as _torch
+            generator = _torch.Generator(device="cpu").manual_seed(int(seed))
+            kwargs["generator"] = generator
         
         prompt = kwargs.get("prompt", "")
         height = kwargs.get("height", 544)
@@ -195,7 +261,13 @@ class WeeVideoPipeline(WeeBasePipeline):
         num_frames = kwargs.get("num_frames", 121)
         steps = kwargs.get("num_inference_steps", 6)
 
+        _video_cache = None
+        _step_callback = kwargs.pop("_weellm_step_callback", None)
+
         if no_cache:
+            # The modular pipelines (MiniMax-H3) have no callback_on_step_end, so
+            # we still hook their denoise loops to drive the studio's progress bar.
+            self._patch_denoise_loops(_underlying, _step_callback, None)
             return super().__call__(**kwargs)
 
         _video_cache = self._setup_cache(
@@ -262,47 +334,9 @@ class WeeVideoPipeline(WeeBasePipeline):
                         _underlying._blocks.sub_blocks[block_name] = CacheMissWrapper(block, _video_cache)
                         break
 
-        # ModularPipeline ignores callback_on_step_end, so we recursively hook loop_step on any Loop block
-        if hasattr(_underlying, "_blocks") and hasattr(_underlying._blocks, "sub_blocks"):
-            def _patch_denoise_loops(blocks_dict):
-                for block in blocks_dict.values():
-                    if hasattr(block, "loop_step") and not getattr(block, "_weellm_patched_loop", False):
-                        original_loop = getattr(block, "loop_step")
-                        def _hooked_loop(self_block, pipe, state, i, t, orig=original_loop):
-                            import os
-                            resume_idx = int(os.environ.get("WEELLM_RESUME_STEP", "0"))
-                            if i < resume_idx:
-                                logger.info(f"\n!!! Fast-Forwarding: Skipping Step {i} !!!")
-                                if i == resume_idx - 1:
-                                    resume_path = os.environ.get("WEELLM_RESUME_PATH", "")
-                                    if resume_path and os.path.exists(resume_path):
-                                        logger.info(f"!!! Injecting Latents from {resume_path} !!!\n")
-                                        import torch
-                                        cached = torch.load(resume_path, map_location="cpu")
-                                        if isinstance(cached, torch.Tensor):
-                                            state.latents = cached.to(state.latents.device)
-                                            state.noise_pred = torch.zeros_like(state.latents)
-                                        elif isinstance(cached, dict) and "latents" in cached:
-                                            state.latents = cached["latents"].to(state.latents.device)
-                                            state.noise_pred = torch.zeros_like(state.latents)
-                                            if "audio_latents" in cached and hasattr(state, "audio_latents"):
-                                                state.audio_latents = cached["audio_latents"].to(getattr(state, "audio_latents").device)
-                                        if hasattr(state, "audio_latents"):
-                                            state.audio_noise_pred = torch.zeros_like(state.audio_latents)
-                                return pipe, state
-                            
-                            pipe, state = orig(pipe, state, i=i, t=t)
-                            callback = _video_cache.get_step_callback()
-                            if callback is not None:
-                                latents = getattr(state, "latents", None)
-                                cb_kwargs = {"latents": latents}
-                                callback(pipe, i, t, cb_kwargs)
-                            return pipe, state
-                        block.loop_step = _hooked_loop.__get__(block, block.__class__)
-                        block._weellm_patched_loop = True
-                    elif hasattr(block, "sub_blocks"):
-                        _patch_denoise_loops(block.sub_blocks)
-            _patch_denoise_loops(_underlying._blocks.sub_blocks)
+        # ModularPipeline ignores callback_on_step_end, so we recursively hook
+        # loop_step on any Loop block (this also drives the studio progress bar).
+        self._patch_denoise_loops(_underlying, _step_callback, _video_cache)
         
         if _ep_hit:
             logger.info("[VideoCache] Text encoder output restored from cache — skipped entirely.")

@@ -76,6 +76,15 @@ class Qwen3VLModelStreamer:
         with default_dtype(self.dtype), init_empty_weights():
             self._model = AutoModel.from_config(config, trust_remote_code=True)
         self._model.eval()
+
+        # A GGUF text encoder stores the final norm and the RoPE inv_freq as
+        # *computed* tensors, not weights.  The key-map's patch_model_before_stream()
+        # materialises them -- without it the attention runs on a meta buffer.
+        if hasattr(self._seeker, "patch_model"):
+            try:
+                self._seeker.patch_model(self._model, config, self.device, self.dtype)
+            except Exception as e:
+                logger.warning("[WeeLLM] patch_model failed for the Qwen3-VL encoder: %s", e)
         
         # Monkey-patch .to() to prevent diffusers from crashing on meta tensors
         def _noop_to(self, *args, **kwargs):

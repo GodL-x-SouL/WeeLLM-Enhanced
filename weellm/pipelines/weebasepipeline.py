@@ -47,6 +47,15 @@ def _has_weights(component_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Text encoder class → module path mapping
 # ---------------------------------------------------------------------------
+# Some checkpoints name a component differently while the weights are identical
+# to another architecture.  Map (checkpoint class name) -> (module, streamer class).
+_TE_STREAMER_ALIAS = {
+    "MiniMaxH3Qwen3VLHFEncoder": (
+        "weellm.models.text_encoders.qwen3_vl_for_conditional_generation",
+        "Qwen3VLForConditionalGenerationStreamer",
+    ),
+}
+
 _TE_MAP = {
     "CLIPTextModel":                          "weellm.models.text_encoders.clip_text_model",
     "CLIPTextModelWithProjection":            "weellm.models.text_encoders.clip_text_model",
@@ -58,7 +67,8 @@ _TE_MAP = {
     "Qwen2_5_VLForConditionalGeneration":     "weellm.models.text_encoders.qwen2_5_vl_for_conditional_generation",
     "Qwen3VLForConditionalGeneration":        "weellm.models.text_encoders.qwen3_vl_for_conditional_generation",
     "Qwen3VLModel":                           "weellm.models.text_encoders.qwen3_vl_model",
-    "MiniMaxH3Qwen3VLHFEncoder":              "weellm.models.text_encoders.minimax_h3_qwen3_vl_hf_encoder",
+    # The FL2VA layout names its encoder MiniMaxH3Qwen3VLHFEncoder; it is the same
+    # Qwen3-VL model, so it is served by the Qwen3-VL streamer (see the alias table).
     "Mistral3ForConditionalGeneration":       "weellm.models.text_encoders.mistral3_for_conditional_generation",
     "GlmModel":                               "weellm.models.text_encoders.glm_model",
     "Gemma2Model":                            "weellm.models.text_encoders.gemma2_model",
@@ -723,11 +733,14 @@ class WeeBasePipeline:
                 out[key].eval()
                 continue
 
-            module_path       = _TE_MAP[hf_cls_name]
-            streamer_cls_name = (
-                "CLIPTextModelStreamer" if "CLIP" in hf_cls_name
-                else hf_cls_name + "Streamer"
-            )
+            if hf_cls_name in _TE_STREAMER_ALIAS:
+                module_path, streamer_cls_name = _TE_STREAMER_ALIAS[hf_cls_name]
+            else:
+                module_path       = _TE_MAP[hf_cls_name]
+                streamer_cls_name = (
+                    "CLIPTextModelStreamer" if "CLIP" in hf_cls_name
+                    else hf_cls_name + "Streamer"
+                )
             module    = importlib.import_module(module_path)
             te_cls    = getattr(module, streamer_cls_name)
             tok_key   = key.replace("text_encoder", "tokenizer")
@@ -1088,12 +1101,16 @@ class WeeBasePipeline:
                     # Use TEMPORAL frame-wise decoding instead: process a fixed chunk
                     # of frames at a time and stitch along the time axis.
                     vae.use_framewise_decoding        = True
-                    vae.tile_sample_min_num_frames    = 9  # frames per chunk
-                    vae.tile_sample_stride_num_frames = 8  # stride (must be ≥8 to avoid 0-stride after //8)
-                    # Disable spatial tiling by setting thresholds above any real resolution.
-                    for _attr in ("tile_sample_min_width", "tile_sample_min_height", "tile_sample_min_size"):
+                    vae.tile_sample_min_num_frames    = 16  # frames per chunk (2 latent frames)
+                    vae.tile_sample_stride_num_frames = 8   # stride (must be >=8: //8 gives the latent step)
+                    # Spatial tiling stays ON (diffusers' default threshold): with it
+                    # disabled the decoder runs every frame at full resolution in one
+                    # pass, which does not fit in the VRAM budget.
+                    for _attr, _val in (("tile_sample_min_width", 512),
+                                        ("tile_sample_min_height", 512),
+                                        ("tile_sample_min_size", 512)):
                         if hasattr(vae, _attr):
-                            setattr(vae, _attr, 10_000)
+                            setattr(vae, _attr, _val)
                     if hasattr(vae, "enable_slicing"):
                         vae.enable_slicing()
                     logger.info(

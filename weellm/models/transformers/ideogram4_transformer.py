@@ -76,26 +76,66 @@ class Ideogram4Transformer2DModelStreamer(BaseTransformerStreamer):
         )
 
     def apply_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
-        """Override to apply FP8 dequantization (weight * scale) before placing on GPU."""
+        """Override to apply FP8 dequantization (weight * scale) before placing on GPU.
+
+        The official FP8 checkpoint keeps the *original* Ideogram attention layout
+        (a fused ``attention.qkv`` linear plus an ``attention.o`` linear), while
+        diffusers' ``Ideogram4Attention`` uses the canonical split layout
+        (``to_q`` / ``to_k`` / ``to_v`` + ``to_out.0``).  The fused QKV rows are
+        contiguous ([q_all | k_all | v_all] -- the same layout the GGUF key-map
+        assumes), and the FP8 scale is per output row, so it splits along with
+        the weight.
+        """
         processed_sd = {}
+        scales = {k: v for k, v in state_dict.items() if k.endswith(".weight_scale")}
+
+        # ---- 1. re-key the original Ideogram layout onto diffusers' split one
         for name, tensor in state_dict.items():
             if name.endswith(".weight_scale"):
                 continue
-            
-            if name.endswith(".weight") and f"{name}_scale" in state_dict:
-                scale = state_dict[f"{name}_scale"].to(device=tensor.device, dtype=torch.float32)
-                
+
+            # Fused QKV -> to_q / to_k / to_v (+ the matching per-row scale)
+            if name.endswith(".attention.qkv.weight"):
+                prefix = name[: -len(".attention.qkv.weight")]
+                third = tensor.shape[0] // 3
+                scale = scales.get(name + "_scale")
+                for i, part in enumerate(("to_q", "to_k", "to_v")):
+                    processed_sd[prefix + ".attention." + part + ".weight"] = \
+                        tensor[i * third:(i + 1) * third].contiguous()
+                    if scale is not None:
+                        processed_sd[prefix + ".attention." + part + ".weight_scale"] = \
+                            scale[i * third:(i + 1) * third].contiguous()
+                continue
+
+            # Fused output projection -> to_out.0
+            if name.endswith(".attention.o.weight"):
+                prefix = name[: -len(".attention.o.weight")]
+                processed_sd[prefix + ".attention.to_out.0.weight"] = tensor
+                scale = scales.get(name + "_scale")
+                if scale is not None:
+                    processed_sd[prefix + ".attention.to_out.0.weight_scale"] = scale
+                continue
+
+            processed_sd[name] = tensor
+
+        # ---- 2. FP8 dequantization: weight * weight_scale (per output row)
+        final_sd = {}
+        for name, tensor in processed_sd.items():
+            if name.endswith(".weight_scale"):
+                continue
+            scale = processed_sd.get(name + "_scale")
+            if scale is not None:
+                scale = scale.to(device=tensor.device, dtype=torch.float32)
                 if scale.dim() == 1:
                     if scale.numel() == tensor.shape[0]:
                         scale = scale.view(-1, 1)
                     elif len(tensor.shape) > 1 and scale.numel() == tensor.shape[1]:
                         scale = scale.view(1, -1)
-                        
                 tensor = (tensor.to(torch.float32) * scale).to(self.dtype)
-                
-            processed_sd[name] = tensor
+            final_sd[name] = tensor
 
-        for name, tensor in processed_sd.items():
+        # ---- 3. place
+        for name, tensor in final_sd.items():
             if tensor.is_floating_point():
                 set_module_tensor_to_device(
                     self.model, name, self.device, value=tensor, dtype=self.dtype
