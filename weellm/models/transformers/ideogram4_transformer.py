@@ -133,7 +133,7 @@ class Ideogram4Transformer2DModelStreamer(BaseTransformerStreamer):
             model = diffusers.Ideogram4Transformer2DModel.from_config(config)
         model.eval()
 
-        self._assert_split_attention_layout(model)
+        cls._assert_split_attention_layout(model)
 
         logger.info("Step 3/3 -- Loading resident transformer tensors to GPU ...")
         streamer = cls(model=model, seeker=seeker, device=device, dtype=dtype, prefetch=prefetch)
