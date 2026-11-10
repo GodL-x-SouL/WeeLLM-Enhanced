@@ -141,8 +141,11 @@ def _push_log(msg):
     except Exception:
         pass
 def _log_text():
+    # Ship only the tail: the log panel is pushed to the browser every 2 s, and
+    # a 12 KB payload each time is pure websocket churn (and makes the textarea
+    # jump/scroll).  6 KB of recent history is plenty.
     with LOG_LOCK:
-        return '\n'.join(LOG_BUF)[-12000:] or '— logs stream here during download and generation —'
+        return '\n'.join(LOG_BUF)[-6000:] or '— logs stream here during download and generation —'
 def ustatus(msg):
     _push_log('[studio] ' + msg)
 
@@ -161,7 +164,7 @@ def bar_html(pct, label):
     pct = max(0.0, min(100.0, pct))
     return ("<div style='font-size:11px;color:#8a8a95;margin:2px 0 4px;'>" + html.escape(label) + "</div>"
             "<div style='height:4px;border-radius:2px;background:#26262e;overflow:hidden;'>"
-            "<div style='height:100%;width:" + ('%.1f' % pct) + "%;background:#c9c9d1;transition:width .3s;'></div></div>")
+            "<div style='height:100%;width:" + ('%.1f' % pct) + "%;background:#c9c9d1;'></div></div>")
 
 # ── UI events ──────────────────────────────────────────────────
 def _models_for(task):
@@ -604,7 +607,7 @@ def bar_html(pct, label):
     pct = max(0.0, min(100.0, pct))
     return ("<div style='font-size:11px;color:#8a8a95;margin:2px 0 4px;'>" + html.escape(label) + "</div>"
             "<div style='height:4px;border-radius:2px;background:#26262e;overflow:hidden;'>"
-            "<div style='height:100%;width:" + ('%.1f' % pct) + "%;background:#c9c9d1;transition:width .3s;'></div></div>")
+            "<div style='height:100%;width:" + ('%.1f' % pct) + "%;background:#c9c9d1;'></div></div>")
 
 
 # ── inference ──────────────────────────────────────────────────
@@ -1119,8 +1122,13 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
         run_b.click(run_all, concurrency_limit=1, **_click_kw)
     except TypeError:
         run_b.click(run_all, **_click_kw)
+    _last_log = {'txt': None}
     def _poll_logs():
-        return _log_text()
+        txt = _log_text()
+        if txt == _last_log['txt']:
+            return _last_log['txt']      # nothing new -> don't churn the socket
+        _last_log['txt'] = txt
+        return txt
     try:
         demo.load(_poll_logs, inputs=[], outputs=[logs_t], every=2)
     except TypeError:
