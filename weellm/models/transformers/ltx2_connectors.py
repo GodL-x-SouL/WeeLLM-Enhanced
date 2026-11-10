@@ -10,6 +10,8 @@ Lazy import keeps ``import weellm`` working; only actual LTX-2 use raises,
 with an actionable message.
 """
 
+import torch.nn as nn
+
 from .base_transformer_streamer import BaseTransformerStreamer
 
 
@@ -29,6 +31,15 @@ def _load_connectors_cls():
 class LTX2ConnectorsStreamer(BaseTransformerStreamer):
     def _get_model_cls(self):
         return _load_connectors_cls()
+
+    def _pre_hook(self, module: nn.Module, args):
+        # Apply any LoRA to this block right after its weights were loaded.
+        args = super()._pre_hook(module, args)
+        loader = getattr(self, "lora_loader", None)
+        if loader is not None:
+            from weellm.models.transformers.base_transformer_streamer import _SHARD_NAME_ATTR
+            loader.apply_to_module(module, getattr(module, _SHARD_NAME_ATTR))
+        return args
 
     def _get_resident_keys(self):
         return [
@@ -94,13 +105,16 @@ class LTX2ConnectorsStreamer(BaseTransformerStreamer):
     @classmethod
     def from_pretrained(
         cls,
-        transformer_dir,
+        transformer_dir=None,
         device="cuda",
         dtype=None,
         prefetch=True,
         prefetch_device=None,
         cache_to_ram=False,
+        model_dir=None,          # alias: the generic loader passes model_dir=
     ):
+        if transformer_dir is None:
+            transformer_dir = model_dir
         from pathlib import Path
         from accelerate import init_empty_weights
         from weellm.io.seeker import get_seeker

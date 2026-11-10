@@ -116,14 +116,20 @@ class VideoStepCache:
         lora_weights: Optional[str] = None,
         save_every: int = 1,
         cache_root: Optional[str] = None,
+        model_id: Optional[str] = None,
+        conditioning: Optional[str] = None,
     ) -> None:
         self.save_every = max(1, int(save_every))
         root = Path(cache_root or os.path.join(os.getcwd(), ".weellm_cache"))
 
-        prompt_hash = _sha1(prompt)
+        # The cache key MUST include the model identity: two quantisations of the
+        # same model (GGUF vs INT8 vs FP8) resolve to the same directory, so
+        # without this the second run returns the first run's cached latents.
+        prompt_hash = _sha1(prompt, str(conditioning))
         run_hash    = _sha1(
             prompt,
             str(height), str(width), str(num_frames), str(steps), str(seed), str(lora_weights),
+            str(model_id), str(conditioning),
         )
 
         self.embeds_dir = root / f"embeds_{prompt_hash}"

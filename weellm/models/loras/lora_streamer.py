@@ -77,9 +77,10 @@ class GenericLazyLoRALoader:
         "U8":   (np.uint8,    None),
     }
 
-    def __init__(self, lora_path: str, scale: float = 1.0):
+    def __init__(self, lora_path: str, scale: float = 1.0, config=None):
         self.lora_path    = lora_path
         self.scale        = scale
+        self.config      = config
         self._skipped_keys: set[str] = set()
 
         # ----------------------------------------------------------------
@@ -98,7 +99,7 @@ class GenericLazyLoRALoader:
         # Build lora_pairs:  (A_file_key, B_file_key, targets)
         # ----------------------------------------------------------------
         from weellm.models.loras.lora_keymaps import build_lora_pairs
-        self.lora_pairs, _ = build_lora_pairs(self.keys)
+        self.lora_pairs, _ = build_lora_pairs(self.keys, config=self.config)
 
         logger.info(
             "[LoRA] Indexed %d LoRA weight pairs from: %s",
@@ -215,6 +216,16 @@ class GenericLazyLoRALoader:
                                     order = slice_info[2]
                                     chunks = delta.chunk(n_chunks, dim=0)
                                     sub_delta = torch.cat([chunks[i] for i in order], dim=0)
+                                elif slice_info[0] == "deinterleave_qkv":
+                                    # MiniMax stores the fused QKV PER-HEAD
+                                    # INTERLEAVED ([h0: q k v, h1: q k v, ...]).
+                                    # The LoRA delta has the same layout, so it
+                                    # must be de-interleaved into [q|k|v] before
+                                    # it can be split into to_q / to_k / to_v.
+                                    num_heads, head_dim = slice_info[1], slice_info[2]
+                                    d = delta.reshape(num_heads, 3, head_dim, -1)
+                                    d = d.permute(1, 0, 2, 3).reshape(3, num_heads * head_dim, -1)
+                                    sub_delta = d[slice_info[3]]
                                 else:
                                     split_idx, total_splits = slice_info
                                     chunks = delta.chunk(total_splits, dim=0)

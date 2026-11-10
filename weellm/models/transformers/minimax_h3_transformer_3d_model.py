@@ -178,7 +178,19 @@ class MiniMaxH3Transformer3DModelStreamer(BaseTransformerStreamer):
                 remapped[dk] = tensor
 
         from weellm.io.memory import place_tensors
-        place_tensors(self.model, remapped, self.device, self.dtype, skip_errors=True)
+        # The reference checkpoint keeps the patch projections and the output
+        # heads in float32 (diffusers lists them in _keep_in_fp32_modules) --
+        # in bf16 their intermediates overflow and the video comes out broken.
+        fp32_modules = list(getattr(self.model, "_keep_in_fp32_modules", None) or [])
+        fp32_names = {
+            k for k in remapped
+            if any(k == m or k.startswith(m + ".") for m in fp32_modules)
+        }
+        bf16_sd = {k: v for k, v in remapped.items() if k not in fp32_names}
+        fp32_sd = {k: v for k, v in remapped.items() if k in fp32_names}
+        if fp32_sd:
+            place_tensors(self.model, fp32_sd, self.device, torch.float32, skip_errors=True)
+        place_tensors(self.model, bf16_sd, self.device, self.dtype, skip_errors=True)
 
     def _pre_hook(self, module: nn.Module, args):
         args = super()._pre_hook(module, args)
@@ -218,6 +230,24 @@ class MiniMaxH3Transformer3DModelStreamer(BaseTransformerStreamer):
         with init_empty_weights(), default_dtype(dtype):
             model = MiniMaxH3Transformer3DModel.from_config(cfg)
         model.eval()
+
+        # diffusers keeps the rope buffers in float32 as well; they are computed
+        # at construction time, so cast them here (bf16 rope loses precision).
+        for _mod_name in list(getattr(model, "_keep_in_fp32_modules", None) or []):
+            _mod = getattr(model, _mod_name, None)
+            if _mod is None:
+                continue
+            for _bn, _buf in list(_mod.named_buffers()):
+                if _buf.dtype == torch.float32:
+                    continue
+                try:
+                    from accelerate.utils.modeling import set_module_tensor_to_device
+                    set_module_tensor_to_device(
+                        model, f"{_mod_name}.{_bn}", device,
+                        value=_buf.detach().to(torch.float32),
+                    )
+                except Exception:
+                    pass
 
         # The pruned GGUF stores an 8-dim AdaLN table instead of the full
         # time-embedding MLP and has no SiLU on the patch projections.  The

@@ -755,7 +755,7 @@ def _run_video(pipe, entry, a, cb, use_cb):
     n = _snap73(a['frames']) if entry['pipe'] == 't2v' else _snap121(a['frames'])
     if n != a['frames']:
         ustatus('frames snapped %d → %d (architecture requirement)' % (a['frames'], n))
-    kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_frames=n, num_inference_steps=a['steps'], seed=a['seed'], no_cache=True)
+    kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_frames=n, num_inference_steps=a['steps'], seed=a['seed'])
     if entry['pipe'] == 'i2v':
         kw['image'] = a['start']
     if a['guid'] > 0:
@@ -792,7 +792,7 @@ def _save_video_out(out, entry_label):
             audio = audio[0]
     except Exception:
         pass
-    _rate = getattr(out, 'sampling_rate', None)
+    _rate = getattr(out, 'sampling_rate', None) or getattr(out, 'audio_rate', None)
     if not _rate:
         _voc = getattr(out, 'vocoder', None)
         _cfg = getattr(_voc, 'config', None)

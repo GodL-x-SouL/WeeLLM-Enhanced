@@ -24,7 +24,7 @@ _REGISTRY = [
     DiffusersFallbackLoRAKeyMap,  # Always keep fallback at the bottom
 ]
 
-def build_lora_pairs(lora_keys: Set[str]) -> Tuple[List[LoRAPair], Any]:
+def build_lora_pairs(lora_keys: Set[str], config=None) -> Tuple[List[LoRAPair], Any]:
     """
     Detect the LoRA naming convention from the key list and return the paired targets:
         (pairs, keymap_cls)
@@ -34,7 +34,10 @@ def build_lora_pairs(lora_keys: Set[str]) -> Tuple[List[LoRAPair], Any]:
     for keymap_cls in _REGISTRY:
         if keymap_cls.detect(lora_keys):
             logger.info("[LoRA] Detected arch: %s — remapping keys.", keymap_cls.NAME)
-            pairs = keymap_cls.build_pairs(lora_keys)
+            try:
+                pairs = keymap_cls.build_pairs(lora_keys, config=config)
+            except TypeError:
+                pairs = keymap_cls.build_pairs(lora_keys)
             return pairs, keymap_cls
 
     logger.debug("[LoRA] No key-map matched — empty pairs.")

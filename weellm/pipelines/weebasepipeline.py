@@ -54,6 +54,10 @@ _TE_STREAMER_ALIAS = {
         "weellm.models.text_encoders.qwen3_vl_for_conditional_generation",
         "Qwen3VLForConditionalGenerationStreamer",
     ),
+    "LTX2TextConnectors": (
+        "weellm.models.transformers.ltx2_connectors",
+        "LTX2ConnectorsStreamer",
+    ),
 }
 
 _TE_MAP = {
@@ -716,7 +720,10 @@ class WeeBasePipeline:
         """Load all text encoders, inject streamers, return streamer references for later eviction."""
         te_streamers = {}
 
-        for key in ["text_encoder", "text_encoder_2", "text_encoder_3", "text_encoder_4"]:
+        # "connectors" is a text-encoder-like component (LTX-2.5 ships the
+        # text connectors as a separate module); it must be loaded here or the
+        # pipeline gets connectors=None.
+        for key in ["text_encoder", "text_encoder_2", "text_encoder_3", "text_encoder_4", "connectors"]:
             override_path = out.pop(f"{key}_path", None)
             
             if key not in index:

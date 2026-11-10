@@ -15,6 +15,37 @@ from weellm.pipelines.weebasepipeline import WeeBasePipeline
 
 logger = logging.getLogger("weellm")
 
+
+def _conditioning_id(kwargs: dict) -> Optional[str]:
+    """Fingerprint the conditioning input (first frame / image).
+
+    Two runs with the same prompt but a different image must not share the
+    cached text embeds or the cached latents.
+    """
+    for _k in ("image", "first_frame", "last_frame", "video"):
+        _v = kwargs.get(_k)
+        if _v is None:
+            continue
+        try:
+            import hashlib
+            if isinstance(_v, (list, tuple)):
+                _v = _v[0] if _v else None
+                if _v is None:
+                    continue
+            if hasattr(_v, "save"):            # PIL image
+                import io
+                _b = io.BytesIO()
+                _v.save(_b, format="PNG")
+                return hashlib.sha1(_b.getvalue()).hexdigest()[:16]
+            if hasattr(_v, "detach"):          # tensor
+                return hashlib.sha1(
+                    _v.detach().to("cpu", torch.float32).numpy().tobytes()
+                ).hexdigest()[:16]
+            return hashlib.sha1(str(_v).encode()).hexdigest()[:16]
+        except Exception:
+            return None
+    return None
+
 # ---------------------------------------------------------------------------
 # Pipeline class name → (module path, class name)
 # ---------------------------------------------------------------------------
@@ -153,7 +184,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                 
         return latents
 
-    def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None):
+    def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None, conditioning=None):
         from weellm.pipelines.video.video_cache import VideoStepCache
         if cache_root is None:
             cache_root = os.path.join(
@@ -169,6 +200,8 @@ class WeeVideoPipeline(WeeBasePipeline):
             lora_weights=lora_weights,
             save_every=save_every,
             cache_root=cache_root,
+            model_id=str(getattr(self, "model_dir", "") or getattr(self, "_model_id", "") or ""),
+            conditioning=conditioning,
         )
         os.makedirs(cache.run_dir_path, exist_ok=True)
         return cache
@@ -271,7 +304,8 @@ class WeeVideoPipeline(WeeBasePipeline):
             return super().__call__(**kwargs)
 
         _video_cache = self._setup_cache(
-            prompt, height, width, num_frames, steps, seed, save_every=cache_every, lora_weights=lora_weights
+            prompt, height, width, num_frames, steps, seed, save_every=cache_every,
+            lora_weights=lora_weights, conditioning=_conditioning_id(kwargs),
         )
         if fresh:
             _video_cache.clear_run()
@@ -363,20 +397,29 @@ class WeeVideoPipeline(WeeBasePipeline):
             
         if lora_weights is not None:
             logger.info(f"Loading LoRA weights from {lora_weights}")
-            
+
             from weellm.models.loras.lora_streamer import GenericLazyLoRALoader
-            lazy_loader = GenericLazyLoRALoader(lora_weights)
-            
-            # 1. Apply to Transformer
             _tr_model = getattr(_underlying, "transformer", None) or getattr(_underlying, "unet", None)
-            if _tr_model is not None:
-                # The shard name for the whole transformer can just be "transformer"
-                lazy_loader.apply_to_module(_tr_model, "transformer")
-                
-            # 2. Apply to Connectors if they exist
+            _cfg = getattr(_tr_model, "config", None)
+            lazy_loader = GenericLazyLoRALoader(lora_weights, config=_cfg)
+
+            # 1. Attach to the transformer streamer.  The blocks are streamed, so
+            #    their weights are still on the meta device here: applying the
+            #    LoRA to the whole model would crash.  The streamer's pre-hook
+            #    applies it per block, right after the block was materialised.
+            _st = getattr(_tr_model, "_weellm_streamer", None)
+            if _st is not None:
+                _st.lora_loader = lazy_loader
+                logger.info("[LoRA] Attached to the transformer streamer (applied per block).")
+            elif _tr_model is not None:
+                logger.warning("[LoRA] No transformer streamer found -- LoRA not applied.")
+
+            # 2. Connectors (LTX-2.5) are a separate streamed module
             _conn_model = getattr(_underlying, "connectors", None)
-            if _conn_model is not None:
-                lazy_loader.apply_to_module(_conn_model, "connectors")
+            _cst = getattr(_conn_model, "_weellm_streamer", None)
+            if _cst is not None:
+                _cst.lora_loader = lazy_loader
+                logger.info("[LoRA] Attached to the connectors streamer.")
 
         if _video_cache.has_final():
             logger.info("[VideoCache] Final-latents cache HIT — running decode-only.")

@@ -12,7 +12,7 @@ class LTX2LoRAKeyMap:
         return False
 
     @staticmethod
-    def build_pairs(lora_keys: Set[str]) -> List[Tuple[str, str, List[Tuple[str, Any]]]]:
+    def build_pairs(lora_keys: Set[str], config=None) -> List[Tuple[str, str, List[Tuple[str, Any]]]]:
         pairs = []
         bases = set()
         

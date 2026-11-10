@@ -13,7 +13,7 @@ class MiniMaxH3LoRAKeyMap:
         return False
 
     @staticmethod
-    def build_pairs(lora_keys: Set[str]) -> List[Tuple[str, str, List[Tuple[str, Any]]]]:
+    def build_pairs(lora_keys: Set[str], config=None) -> List[Tuple[str, str, List[Tuple[str, Any]]]]:
         pairs = []
         bases = set()
         for k in lora_keys:
@@ -39,10 +39,25 @@ class MiniMaxH3LoRAKeyMap:
             targets = []
             if target.endswith(".attn.qkv_proj"):
                 prefix = target.removesuffix("qkv_proj")
-                # We need to slice B into 3 pieces: to_q, to_k, to_v
-                targets.append((f"{prefix}to_q.weight", (0, 3)))
-                targets.append((f"{prefix}to_k.weight", (1, 3)))
-                targets.append((f"{prefix}to_v.weight", (2, 3)))
+                # MiniMax stores the fused QKV PER-HEAD INTERLEAVED
+                # ([h0: q k v, h1: q k v, ...]), and so is the LoRA delta.
+                # The diffusers weights are contiguous thirds, so the delta has
+                # to be de-interleaved first -- the head geometry comes from
+                # the model config.
+                num_heads = getattr(config, "num_attention_heads", None) if config is not None else None
+                head_dim = getattr(config, "attention_head_dim", None) if config is not None else None
+                if num_heads and head_dim:
+                    for _i, _part in enumerate(("to_q", "to_k", "to_v")):
+                        targets.append((
+                            f"{prefix}{_part}.weight",
+                            ("deinterleave_qkv", num_heads, head_dim, _i),
+                        ))
+                else:
+                    # No config: fall back to contiguous thirds (correct only for
+                    # checkpoints that store the fused QKV contiguously).
+                    targets.append((f"{prefix}to_q.weight", (0, 3)))
+                    targets.append((f"{prefix}to_k.weight", (1, 3)))
+                    targets.append((f"{prefix}to_v.weight", (2, 3)))
             elif target.endswith(".mlp.fc1"):
                 # We need to split into 2 pieces and reorder them: (value, gate) -> (gate, value)
                 # This requires a special slice info or custom logic.

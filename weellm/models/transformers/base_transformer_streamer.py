@@ -153,6 +153,10 @@ class BaseTransformerStreamer(ABC):
             
         self._double_buffering_enabled = True
         self._db_calibration_done = False
+        # Optional LoRA applier (see weellm.models.loras.lora_streamer): when set,
+        # it is applied per block in the pre-hook, i.e. after the block's weights
+        # have been materialised in VRAM.
+        self.lora_loader = None
             
         self._install_hooks()
         

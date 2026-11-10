@@ -45,9 +45,17 @@ class LTX2VideoTransformer3DModelStreamer(BaseTransformerStreamer):
         return order
 
     def _get_resident_ckpt_keys(self) -> List[str]:
+        # The GGUF also carries the text connectors (video_embeddings_connector.* /
+        # audio_embeddings_connector.*, ~6.3 GB).  They belong to the separate
+        # LTX2TextConnectors module, which is loaded from the repo's
+        # connectors/ folder, so treating them as resident here would dequantize
+        # 6.3 GB into VRAM for nothing.
         return [
             k for k in self.seeker.weight_map
             if not k.startswith(_CKPT_STREAMING_PREFIX)
+            and "_embeddings_connector." not in k
+            and not k.startswith("video_embeddings_connector.")
+            and not k.startswith("audio_embeddings_connector.")
         ]
 
     def _get_resident_keys(self) -> List[str]:
