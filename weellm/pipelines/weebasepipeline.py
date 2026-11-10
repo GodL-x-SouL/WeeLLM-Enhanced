@@ -452,16 +452,20 @@ class WeeBasePipeline:
             # `unconditional_transformer` (image-only, zeroed text features).
             # Reusing the conditional model there makes the guidance blend
             # amplify the wrong direction -> coherent but off-prompt images.
+            unc_path_override = diffusers_kwargs.pop("unconditional_transformer_path", None)
             unc_dir = model_dir_path / "unconditional_transformer"
-            if _has_weights(unc_dir):
+            if unc_path_override is not None or _has_weights(unc_dir):
                 try:
+                    from ..io.seeker import override_weights_path
                     # Same streamer class as the conditional model, but reading the
-                    # unconditional weights from its own folder (no GGUF override).
+                    # unconditional weights from its own folder (or from an
+                    # explicit override such as a GGUF file / Hub repo path).
                     unc_cls = type(transformer_streamer)
-                    unc_streamer = unc_cls.from_pretrained(
-                        unc_dir, device=device, dtype=effective_dtype,
-                        prefetch=False, cache_to_ram=cache_to_ram,
-                    )
+                    with override_weights_path(unc_path_override, subfolder="unconditional_transformer"):
+                        unc_streamer = unc_cls.from_pretrained(
+                            unc_dir, device=device, dtype=effective_dtype,
+                            prefetch=False, cache_to_ram=cache_to_ram,
+                        )
                     unc_model = getattr(unc_streamer, "model", getattr(unc_streamer, "_model", unc_streamer))
                     unc_model = cls._patch_to(unc_model)
                     unc_model._weellm_streamer = unc_streamer
@@ -474,7 +478,7 @@ class WeeBasePipeline:
                     unc_streamer._double_buffering_enabled = False
                     logger.info(
                         "Loaded dedicated unconditional_transformer (asymmetric CFG) from %s",
-                        unc_dir,
+                        unc_path_override or unc_dir,
                     )
                 except Exception as e:
                     logger.warning(

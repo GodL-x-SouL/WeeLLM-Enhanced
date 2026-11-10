@@ -11,14 +11,26 @@ MODELS = {
 
  'ideogram-4': dict(task='t2i', label='Ideogram 4', pipe='t2i',
   repo_url='https://huggingface.co/ideogram-ai/ideogram-4-fp8', mirror_url=None, gated=True,
-  access='Gated repo — token required (even for quants: encoder + VAE come from here). The GGUF replaces the conditional transformer only; the separately trained unconditional_transformer (+9.3 GB) is still required for correct guidance.',
+  access='Gated repo — token required (even for quants: encoder + VAE come from here). The GGUF replaces the conditional transformer only; the separately trained unconditional_transformer is also required for correct guidance.',
   gguf_repo_url='https://huggingface.co/Abiray/ideogram-4-GGUF',
+  # The negative CFG branch is a DIFFERENT model — it needs its own weights.
+  # Served as GGUF too, so every streamed byte stays small (disk traffic per
+  # step is what actually decides the runtime in WeeLLM's streaming design).
+  unc_gguf_repo_url='https://huggingface.co/stduhpf/ideogram-4-gguf',
+  unc_gguf={
+   'ideogram4-Q4_K.gguf':   'ideogram4_unconditional-iQ4_NL.gguf',
+   'ideogram4-iQ4_NL.gguf': 'ideogram4_unconditional-iQ4_NL.gguf',
+   'ideogram4-Q6_K.gguf':   'ideogram4_unconditional-iQ4_NL.gguf',
+   'ideogram4-Q8_0.gguf':   'ideogram4_unconditional-Q8_0.gguf',
+  },
   steps=30, guid=0.0, w=1024, h=1024,
   ignore=['assets/*'],
   need_unconditional=True,
   quants=[
-   ('full', 'Official FP8 release · gated', 'https://huggingface.co/ideogram-ai/ideogram-4-fp8'),
-   ('ideogram4-Q4_K.gguf', 'Q4_K · 5.8 GB · recommended (no _M exists for this model)', 'https://huggingface.co/Abiray/ideogram-4-GGUF/blob/main/ideogram4-Q4_K.gguf'),
+   ('full', 'Official FP8 release · gated · best quality', 'https://huggingface.co/ideogram-ai/ideogram-4-fp8'),
+   ('ideogram4-Q4_K.gguf', 'Q4_K · 5.8 GB · fastest (cached)', 'https://huggingface.co/Abiray/ideogram-4-GGUF/blob/main/ideogram4-Q4_K.gguf'),
+   ('ideogram4-Q6_K.gguf', 'Q6_K · 8.0 GB · better quality', 'https://huggingface.co/stduhpf/ideogram-4-gguf/blob/main/ideogram4-Q6_K.gguf', 'stduhpf/ideogram-4-gguf'),
+   ('ideogram4-Q8_0.gguf', 'Q8_0 · 10.1 GB · closest to FP8', 'https://huggingface.co/stduhpf/ideogram-4-gguf/blob/main/ideogram4-Q8_0.gguf', 'stduhpf/ideogram-4-gguf'),
   ],
   default_q='ideogram4-Q4_K.gguf'),
 
@@ -381,6 +393,22 @@ def _cached_plan_bytes(repo, patterns, exclude, ggufs, token):
     return cached
 
 
+def _quant_spec(entry, quant):
+    """Resolve the (repo, file) pairs a quant choice needs.
+
+    Returns (cond_repo, cond_file, unc_repo, unc_file).  ``unc_file`` is the
+    GGUF for the separate negative-CFG model (Ideogram4); it is None when the
+    quant is the full-precision release.
+    """
+    repo = entry.get('gguf_repo_url')
+    for q in entry.get('quants', []):
+        if q[0] == quant and len(q) > 3 and q[3]:
+            repo = q[3]
+    unc_repo = entry.get('unc_gguf_repo_url') or repo
+    unc_file = (entry.get('unc_gguf') or {}).get(quant)
+    return repo, quant, unc_repo, unc_file
+
+
 def plan_download(entry, quant, token):
     repo = _rid(entry['repo_url'])
     if entry.get('mirror_url') and not (token or '').strip():
@@ -394,8 +422,9 @@ def plan_download(entry, quant, token):
         ignore = ignore + ['transformer/*.safetensors']
         # Ideogram4 needs its separately trained `unconditional_transformer`
         # (asymmetric CFG): the negative branch is a DIFFERENT model, so it
-        # cannot be replaced by the conditional GGUF.
-        if not entry.get('need_unconditional'):
+        # cannot be replaced by the conditional GGUF.  When it is served as its
+        # own GGUF we can skip the fp8 safetensors entirely.
+        if (entry.get('unc_gguf') or {}).get(quant):
             ignore = ignore + ['unconditional_transformer/*.safetensors']
         # COLAB SLIM (free-tier disk): skip weights that are never executed.
         # - prompt_enhancer: the LTX video adapter hard-skips it (dummy part).
@@ -406,17 +435,24 @@ def plan_download(entry, quant, token):
         if entry.get('te_gguf') or entry.get('te_safetensors'):
             ignore = ignore + ['text_encoder/*.safetensors', 'text_encoder_2/*.safetensors',
                                'text_encoder_3/*.safetensors', 'text_encoder_4/*.safetensors']
-        grepo = _rid(entry['gguf_repo_url'])
-        gsize, _ = _gguf_bytes(grepo, quant, token)
+        grepo, gfile, ugrepo, ugfile = _quant_spec(entry, quant)
+        gsize, _ = _gguf_bytes(grepo, gfile, token)
         if gsize == 0:
-            raise RuntimeError('Quant file not found on Hub: %s/%s' % (grepo, quant))
-        ggufs.append((grepo, quant))
+            raise RuntimeError('Quant file not found on Hub: %s/%s' % (grepo, gfile))
+        ggufs.append((grepo, gfile))
         base_total, _ = _repo_bytes(repo, token, patterns=entry.get('fetch_patterns'), exclude=['transformer/*.safetensors'] + ignore)
         if entry.get('need_unconditional'):
-            parts.append(('Base %s : encoder + VAE + configs + unconditional_transformer (conditional transformer skipped)' % repo, base_total, 'https://huggingface.co/' + repo))
+            parts.append(('Base %s : encoder + VAE + configs (both transformers served as GGUF)' % repo, base_total, 'https://huggingface.co/' + repo))
         else:
             parts.append(('Base %s : encoder + VAE + configs (transformer skipped)' % repo, base_total, 'https://huggingface.co/' + repo))
-        parts.append(('Transformer ' + quant, gsize, entry['gguf_repo_url'] + '/blob/main/' + quant))
+        parts.append(('Transformer ' + gfile, gsize, 'https://huggingface.co/%s/blob/main/%s' % (grepo, gfile)))
+        if ugfile:
+            # The negative CFG branch is a separate model -> its own GGUF.
+            ugsize, _ = _gguf_bytes(ugrepo, ugfile, token)
+            if ugsize == 0:
+                raise RuntimeError('Unconditional GGUF not found on Hub: %s/%s' % (ugrepo, ugfile))
+            ggufs.append((ugrepo, ugfile))
+            parts.append(('Unconditional transformer ' + ugfile, ugsize, 'https://huggingface.co/%s/blob/main/%s' % (ugrepo, ugfile)))
         if entry.get('te_gguf'):
             trepo = _rid(entry['te_gguf'][0])
             tsize, _ = _gguf_bytes(trepo, entry['te_gguf'][1], token)
@@ -500,6 +536,11 @@ def _load_worker(entry, quant, model_dir, dtype, vram_b, ram_b, state):
         import weellm
         cls = getattr(weellm, PIPE_CLS[entry['pipe']])
         kw = dict(device='cuda', torch_dtype=dtype, prefetch=(quant == 'full'), cache_to_ram=False, vae_tile_size=512, vram_budget=vram_b, ram_budget=ram_b)
+        # The raw-weight RAM cache is the single biggest speed lever in WeeLLM's
+        # streaming design: it keeps the *packed* weights of the streamed blocks in
+        # host RAM so the per-step disk read mostly disappears.  Without it the
+        # cache auto-disables on hosts with >=16 GB RAM (ram_cache.py:149-164).
+        kw['ram_cache_gb'] = max(0.0, float(ram_b))
         if entry.get('need_unconditional'):
             # Asymmetric CFG runs a SECOND 9.3B model (the unconditional branch):
             # leave VRAM headroom for its resident weights + one streamed block.
@@ -507,8 +548,14 @@ def _load_worker(entry, quant, model_dir, dtype, vram_b, ram_b, state):
             ustatus('asymmetric CFG: VRAM budget lowered to %.1f GB for the unconditional branch'
                     % kw['vram_budget'])
         if quant != 'full':
-            kw['transformer_path'] = '%s/%s' % (_rid(entry['gguf_repo_url']), quant)
+            _crepo, _cfile, _urepo, _ufile = _quant_spec(entry, quant)
+            kw['transformer_path'] = '%s/%s' % (_rid(_crepo), _cfile)
             kw['prefetch'] = False
+            if _ufile:
+                # Ideogram4's negative CFG branch is a SEPARATE model; serving it
+                # from its own GGUF keeps every streamed byte small (disk traffic
+                # per step is what dominates the runtime).
+                kw['unconditional_transformer_path'] = '%s/%s' % (_rid(_urepo), _ufile)
             if entry.get('te_gguf'):
                 kw['text_encoder_path'] = '%s/%s' % (_rid(entry['te_gguf'][0]), entry['te_gguf'][1])
             if entry.get('te_safetensors'):
@@ -1061,7 +1108,7 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
             dtype_r = _C(gr.Radio, choices=['bfloat16', 'float16'], value='bfloat16', label='Dtype')
         with _C(gr.Row):
             vram_s = _C(gr.Slider, 2, 16, value=_auto_vram, step=0.5, label='VRAM budget (GB)')
-            ram_s = _C(gr.Slider, 2, 24, value=_auto_ram, step=0.5, label='RAM budget (GB)')
+            ram_s = _C(gr.Slider, 2, 24, value=_auto_ram, step=0.5, label='RAM budget (GB) · weight cache')
     with _C(gr.Accordion, 'Logs', open=False):
         logs_t = _C(gr.Textbox, label='Live logs', lines=10, max_lines=20, autoscroll=True, show_copy_button=True, value='— press Run · logs stream here —')
     task_r.change(on_task, inputs=[task_r], outputs=[model_d, quant_d, vid_box, i2v_box, steps_s, w_s, h_s, frames_s, hint_h])
