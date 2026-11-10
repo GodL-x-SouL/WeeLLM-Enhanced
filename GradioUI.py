@@ -1165,12 +1165,18 @@ def serve(share=None):
         demo.queue()
     if share is None:
         share = REAL or _IS_KAGGLE or _IS_COLAB
-    if share:
-        demo.launch(server_name='0.0.0.0', share=True, inline=False, quiet=True,
-                    prevent_thread_lock=True, show_error=False)
-    else:
-        demo.launch(server_name='127.0.0.1', server_port=7860, share=False,
-                    show_error=True, prevent_thread_lock=True)
+    # Gradio 6 moved `theme`/`css` from the Blocks constructor to launch();
+    # Gradio 5 only accepts them on Blocks.  Try the new way, fall back to the
+    # old one (the CSS/theme are also still set on Blocks for Gradio 5).
+    _launch_kw = dict(server_name='0.0.0.0' if share else '127.0.0.1',
+                      share=share, inline=False, quiet=True,
+                      prevent_thread_lock=True, show_error=not share)
+    if not share:
+        _launch_kw['server_port'] = 7860
+    try:
+        demo.launch(css=GRADIO_CSS, theme=_studio_theme(), **_launch_kw)
+    except TypeError:
+        demo.launch(**_launch_kw)
     return getattr(demo, 'share_url', None) or getattr(demo, 'local_url', None)
 
 if __name__ == '__main__':
