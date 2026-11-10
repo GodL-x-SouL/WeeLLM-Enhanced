@@ -513,11 +513,16 @@ class WeeBasePipeline:
             pass
 
 
-        # If still not found, scan image/adapters/ for model-specific pipeline implementations.
-        # Uses rglob so any nested subfolder (e.g. adapters/) is also covered automatically.
+        # If still not found, scan the local adapter folders for a model-specific
+        # pipeline implementation.  Both image/ and video/ hold adapters (the
+        # video ones provide the MiniMax-H3 / LTX-2.5 pipelines that diffusers
+        # only ships as modular pipelines).  Uses rglob so any nested subfolder
+        # is covered automatically.
         if pipeline_cls is None:
-            pipelines_dir = Path(__file__).parent / "image"
-            if pipelines_dir.exists():
+            for sub in ("image", "video"):
+                pipelines_dir = Path(__file__).parent / sub
+                if not pipelines_dir.exists():
+                    continue
                 for py_file in pipelines_dir.rglob("*.py"):
                     if py_file.name == "__init__.py":
                         continue
@@ -528,10 +533,12 @@ class WeeBasePipeline:
                         spec.loader.exec_module(custom_module)
                         if hasattr(custom_module, pipeline_class_name):
                             pipeline_cls = getattr(custom_module, pipeline_class_name)
-                            logger.info(f"Loaded adapter pipeline {pipeline_class_name} from {py_file.relative_to(pipelines_dir)}")
+                            logger.info(f"Loaded adapter pipeline {pipeline_class_name} from {py_file.relative_to(Path(__file__).parent)}")
                             break
                     except Exception as e:
                         pass
+                if pipeline_cls is not None:
+                    break
         
         if pipeline_cls is None:
             raise ImportError(f"Could not find pipeline class {pipeline_class_name} in diffusers, local custom files, or external_pipelines.")

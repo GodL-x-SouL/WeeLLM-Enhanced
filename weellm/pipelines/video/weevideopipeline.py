@@ -20,6 +20,11 @@ logger = logging.getLogger("weellm")
 # ---------------------------------------------------------------------------
 _VIDEO_MAP = {
     "LTX2Pipeline":("weellm.pipelines.video.adapters.ltx2_pipeline","WeeLTX2Pipeline"),
+    # The MiniMax-H3 FL2VA checkpoint ships `_class_name: MiniMaxH3Pipeline`,
+    # while diffusers only exposes the *modular* pipeline (MiniMaxH3ModularPipeline)
+    # -- and neither name is exported at the diffusers top level any more.
+    # Both names route to our patched modular adapter.
+    "MiniMaxH3Pipeline":("weellm.pipelines.video.adapters.minimax_h3_modular_pipeline","WeeMiniMaxPipeline"),
     "MiniMaxH3ModularPipeline":("weellm.pipelines.video.adapters.minimax_h3_modular_pipeline","WeeMiniMaxPipeline"),
     "WanPipeline":("weellm.pipelines.video.weevideopipeline","WeeVideoPipeline"),
     "CogVideoXPipeline":("weellm.pipelines.video.weevideopipeline","WeeVideoPipeline"),
