@@ -176,11 +176,11 @@ def on_task(task):
     opts = _models_for(task)
     first = opts[0][1] if opts else None
     e = MODELS[first]
-    qdefault = [l for v, l, _u in e['quants'] if v == e['default_q']][0]
-    return (gr.update(choices=opts, value=first), gr.update(choices=[l for _v, l, _u in e['quants']], value=qdefault), gr.update(visible=(task in ('t2v', 'i2v'))), gr.update(visible=(task == 'i2v')), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 73)), model_hint(e))
+    qdefault = [q[1] for q in e['quants'] if q[0] == e['default_q']][0]
+    return (gr.update(choices=opts, value=first), gr.update(choices=[q[1] for q in e['quants']], value=qdefault), gr.update(visible=(task in ('t2v', 'i2v'))), gr.update(visible=(task == 'i2v')), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 73)), model_hint(e))
 def on_model(model_key):
     e = MODELS[model_key]
-    return (gr.update(choices=[l for _v, l, _u in e['quants']], value=[l for v, l, _u in e['quants'] if v == e['default_q']][0]), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 73)), model_hint(e))
+    return (gr.update(choices=[q[1] for q in e['quants']], value=[q[1] for q in e['quants'] if q[0] == e['default_q']][0]), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 73)), model_hint(e))
 def model_hint(e):
     return ("<div style='font-size:12px;color:#8a8a95;line-height:1.5;'><a style='color:#aab4e8;' href='%s' target='_blank'>%s</a> · %s</div>" % (e['repo_url'], _rid(e['repo_url']), html.escape(e['access'])))
 
@@ -1101,7 +1101,7 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
     _C(gr.HTML, "<div class='wl-h1'>WeeLLM Studio</div>")
     task_r = _C(gr.Radio, choices=TASKS, value='t2i', label='Task', show_label=False)
     model_d = _C(gr.Dropdown, choices=_models_for('t2i'), value='ideogram-4', label='Model')
-    quant_d = _C(gr.Dropdown, choices=[l for _v, l, _u in MODELS['ideogram-4']['quants']], value=[l for v, l, _u in MODELS['ideogram-4']['quants'] if v == MODELS['ideogram-4']['default_q']][0], label='Quantization')
+    quant_d = _C(gr.Dropdown, choices=[q[1] for q in MODELS['ideogram-4']['quants']], value=[q[1] for q in MODELS['ideogram-4']['quants'] if q[0] == MODELS['ideogram-4']['default_q']][0], label='Quantization')
     hint_h = _C(gr.HTML, model_hint(MODELS['ideogram-4']))
     prompt_t = _C(gr.Textbox, label='Prompt', lines=3, placeholder='Describe what to generate…')
     with _C(gr.Row, visible=False) as i2v_box:

@@ -10,6 +10,7 @@ import torch
 import inspect
 import logging
 import importlib
+from typing import Optional
 
 from weellm.pipelines.weebasepipeline import WeeBasePipeline
 
@@ -296,6 +297,7 @@ class WeeVideoPipeline(WeeBasePipeline):
 
         _video_cache = None
         _step_callback = kwargs.pop("_weellm_step_callback", None)
+        _underlying = getattr(self, "_pipeline", self)
 
         if no_cache:
             # The modular pipelines (MiniMax-H3) have no callback_on_step_end, so
@@ -311,7 +313,6 @@ class WeeVideoPipeline(WeeBasePipeline):
             _video_cache.clear_run()
         
         # Intercept encode_prompt
-        _underlying = getattr(self, "_pipeline", self)
         _ep_hit = _video_cache.wrap_pipeline_encode_prompt(_underlying, device=str(self.device))
         # Fallback for ModularPipeline which has no encode_prompt but uses blocks
         if not _ep_hit and hasattr(_underlying, "_blocks") and hasattr(_underlying._blocks, "sub_blocks"):
