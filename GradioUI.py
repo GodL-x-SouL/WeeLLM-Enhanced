@@ -546,15 +546,57 @@ def bar_html(pct, label):
 
 
 # ── inference ──────────────────────────────────────────────────
+# Ideogram4's native default guidance schedule: a 7.0 taper that drops to 3.0
+# for the last three (polish) steps.  Used as a fallback if the installed
+# diffusers cannot be introspected for its own default.
+_IDEOGRAM4_GUIDANCE_DEFAULT = (7.0,) * 45 + (3.0,) * 3
+
 def _native_supports(pipe, name):
+    return name in _native_params(pipe)
+def _native_params(pipe):
+    """Parameters of the native pipeline's __call__, looked up defensively.
+
+    diffusers wraps ``__call__`` in ``@torch.no_grad()`` / docstring decorators,
+    and the wrapper chain can hide the real signature.  Unwrap manually and fall
+    back to the raw ``__defaults__`` mapping so a schedule lookup never fails
+    silently (a failed lookup means the native default schedule silently leaks
+    through and collides with the requested step count).
+    """
+    fn = getattr(type(getattr(pipe, "_pipeline", pipe)), "__call__", None)
+    if fn is None:
+        return {}
+    seen = 0
+    while hasattr(fn, "__wrapped__") and seen < 16:
+        fn = fn.__wrapped__
+        seen += 1
     try:
-        return name in inspect.signature(pipe._pipeline.__call__).parameters
+        return inspect.signature(fn).parameters
     except Exception:
-        return False
-def _native_default(pipe, name):
+        pass
     try:
-        d = inspect.signature(pipe._pipeline.__call__).parameters[name].default
-        return None if d is inspect.Parameter.empty else d
+        code = fn.__code__
+        names = code.co_varnames[: code.co_argcount]
+        defaults = fn.__defaults__ or ()
+        out = {}
+        for nm, dv in zip(names[len(names) - len(defaults):], defaults):
+            out[nm] = dv
+        for nm, dv in (getattr(fn, "__kwdefaults__", None) or {}).items():
+            out[nm] = dv
+        return out
+    except Exception:
+        return {}
+def _native_default(pipe, name):
+    params = _native_params(pipe)
+    if name not in params:
+        return None
+    d = params[name]
+    d = getattr(d, "default", None)
+    if d is inspect.Parameter.empty:
+        return None
+    return d
+def _as_schedule(seq):
+    try:
+        return [float(v) for v in seq]
     except Exception:
         return None
 def _resample_schedule(seq, n):
@@ -574,26 +616,48 @@ def _resample_schedule(seq, n):
         f = p - lo
         out.append(seq[lo] * (1 - f) + seq[hi] * f)
     return out
+def _guidance_plan(pipe, a):
+    """Decide the guidance kwargs for this run.
+
+    Ideogram4 accepts EITHER a constant ``guidance_scale`` OR a per-step
+    ``guidance_schedule`` (mutually exclusive), and its native default schedule
+    has a fixed length (48) that must equal ``num_inference_steps``.  So the
+    schedule always has to be spelled out explicitly.
+    """
+    n = int(a['steps'])
+    sched = _as_schedule(_native_default(pipe, 'guidance_schedule'))
+    if sched is None and not _native_supports(pipe, 'guidance_schedule'):
+        # Pipeline without a per-step schedule -> plain constant guidance.
+        if a['guid'] > 0 and _native_supports(pipe, 'guidance_scale'):
+            return {'guidance_scale': float(a['guid'])}, 'scale'
+        return {}, 'none'
+    if a['guid'] > 0:
+        return {'guidance_scale': float(a['guid']), 'guidance_schedule': None}, 'scale'
+    base = sched if sched else list(_IDEOGRAM4_GUIDANCE_DEFAULT)
+    return {'guidance_schedule': _resample_schedule(base, n)}, 'schedule(%d)' % n
 def _run_t2i(pipe, a, cb, use_cb):
     kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_inference_steps=a['steps'], seed=a['seed'])
-    if _native_supports(pipe, 'guidance_schedule'):
-        # Ideogram4 defaults guidance_schedule to a fixed 48-step tuple: it clashes
-        # with an explicit guidance_scale and with any other step count, so set it
-        # explicitly instead of relying on the native default.
-        if a['guid'] > 0:
-            kw['guidance_scale'] = a['guid']
-            kw['guidance_schedule'] = None
-        else:
-            sched = _native_default(pipe, 'guidance_schedule')
-            if sched is not None:
-                kw['guidance_schedule'] = _resample_schedule(sched, a['steps'])
-    elif a['guid'] > 0 and _native_supports(pipe, 'guidance_scale'):
-        kw['guidance_scale'] = a['guid']
+    gk, gmode = _guidance_plan(pipe, a)
+    kw.update(gk)
+    ustatus('guidance mode: %s' % gmode)
     if a['neg'] and _native_supports(pipe, 'negative_prompt'):
         kw['negative_prompt'] = a['neg']
     if use_cb and _native_supports(pipe, 'callback_on_step_end'):
         kw['callback_on_step_end'] = cb
-    return pipe.generate(**kw)
+    try:
+        return pipe.generate(**kw)
+    except ValueError as e:
+        # The native default schedule has a fixed length: if it slipped through
+        # (native default instead of our explicit one) resample it and retry.
+        if 'guidance_schedule' not in str(e) or 'guidance_schedule' in kw:
+            raise
+        base = _as_schedule(_native_default(pipe, 'guidance_schedule'))
+        if base is None:
+            base = list(_IDEOGRAM4_GUIDANCE_DEFAULT)
+        kw['guidance_schedule'] = _resample_schedule(base, int(a['steps']))
+        ustatus('guidance schedule length mismatch -> retried with %d-step schedule'
+                % len(kw['guidance_schedule']))
+        return pipe.generate(**kw)
 def _run_video(pipe, entry, a, cb, use_cb):
     n = _snap73(a['frames']) if entry['pipe'] == 't2v' else _snap121(a['frames'])
     if n != a['frames']:
