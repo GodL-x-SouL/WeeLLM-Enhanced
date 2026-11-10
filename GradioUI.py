@@ -11,10 +11,11 @@ MODELS = {
 
  'ideogram-4': dict(task='t2i', label='Ideogram 4', pipe='t2i',
   repo_url='https://huggingface.co/ideogram-ai/ideogram-4-fp8', mirror_url=None, gated=True,
-  access='Gated repo — token required (even for quants: encoder + VAE come from here). One GGUF serves both transformer branches.',
+  access='Gated repo — token required (even for quants: encoder + VAE come from here). The GGUF replaces the conditional transformer only; the separately trained unconditional_transformer (+9.3 GB) is still required for correct guidance.',
   gguf_repo_url='https://huggingface.co/Abiray/ideogram-4-GGUF',
   steps=30, guid=0.0, w=1024, h=1024,
   ignore=['assets/*'],
+  need_unconditional=True,
   quants=[
    ('full', 'Official FP8 release · gated', 'https://huggingface.co/ideogram-ai/ideogram-4-fp8'),
    ('ideogram4-Q4_K.gguf', 'Q4_K · 5.8 GB · recommended (no _M exists for this model)', 'https://huggingface.co/Abiray/ideogram-4-GGUF/blob/main/ideogram4-Q4_K.gguf'),
@@ -390,7 +391,12 @@ def plan_download(entry, quant, token):
         total, n = _repo_bytes(repo, token, patterns=entry.get('fetch_patterns'), exclude=ignore)
         parts.append(('%s full repo (%d files)' % (repo, n), total, 'https://huggingface.co/' + repo))
     else:
-        ignore = ignore + ['transformer/*.safetensors', 'unconditional_transformer/*.safetensors']
+        ignore = ignore + ['transformer/*.safetensors']
+        # Ideogram4 needs its separately trained `unconditional_transformer`
+        # (asymmetric CFG): the negative branch is a DIFFERENT model, so it
+        # cannot be replaced by the conditional GGUF.
+        if not entry.get('need_unconditional'):
+            ignore = ignore + ['unconditional_transformer/*.safetensors']
         # COLAB SLIM (free-tier disk): skip weights that are never executed.
         # - prompt_enhancer: the LTX video adapter hard-skips it (dummy part).
         # - text_encoder weights: only when a quant encoder replaces them
@@ -405,8 +411,11 @@ def plan_download(entry, quant, token):
         if gsize == 0:
             raise RuntimeError('Quant file not found on Hub: %s/%s' % (grepo, quant))
         ggufs.append((grepo, quant))
-        base_total, _ = _repo_bytes(repo, token, patterns=entry.get('fetch_patterns'), exclude=['transformer/*.safetensors', 'unconditional_transformer/*.safetensors'] + ignore)
-        parts.append(('Base %s : encoder + VAE + configs (transformer skipped)' % repo, base_total, 'https://huggingface.co/' + repo))
+        base_total, _ = _repo_bytes(repo, token, patterns=entry.get('fetch_patterns'), exclude=['transformer/*.safetensors'] + ignore)
+        if entry.get('need_unconditional'):
+            parts.append(('Base %s : encoder + VAE + configs + unconditional_transformer (conditional transformer skipped)' % repo, base_total, 'https://huggingface.co/' + repo))
+        else:
+            parts.append(('Base %s : encoder + VAE + configs (transformer skipped)' % repo, base_total, 'https://huggingface.co/' + repo))
         parts.append(('Transformer ' + quant, gsize, entry['gguf_repo_url'] + '/blob/main/' + quant))
         if entry.get('te_gguf'):
             trepo = _rid(entry['te_gguf'][0])
@@ -421,7 +430,7 @@ def plan_download(entry, quant, token):
             ggufs.append((trepo, entry['te_safetensors'][1]))
             parts.append(('Text-encoder ' + entry['te_safetensors'][1].rsplit('/', 1)[-1], tsize, entry['te_safetensors'][0] + '/blob/main/' + entry['te_safetensors'][1]))
         total = sum(p[1] for p in parts)
-    _excl = list(ignore) if quant == 'full' else (['transformer/*.safetensors', 'unconditional_transformer/*.safetensors'] + ignore)
+    _excl = list(ignore) if quant == 'full' else (['transformer/*.safetensors'] + ignore)
     cached = _cached_plan_bytes(repo, entry.get('fetch_patterns'), _excl, ggufs, token)
     need = max(0, total - cached)
     free = shutil.disk_usage(os.path.expanduser('~/.cache/huggingface')).free
@@ -491,6 +500,12 @@ def _load_worker(entry, quant, model_dir, dtype, vram_b, ram_b, state):
         import weellm
         cls = getattr(weellm, PIPE_CLS[entry['pipe']])
         kw = dict(device='cuda', torch_dtype=dtype, prefetch=(quant == 'full'), cache_to_ram=False, vae_tile_size=512, vram_budget=vram_b, ram_budget=ram_b)
+        if entry.get('need_unconditional'):
+            # Asymmetric CFG runs a SECOND 9.3B model (the unconditional branch):
+            # leave VRAM headroom for its resident weights + one streamed block.
+            kw['vram_budget'] = max(2.0, round(vram_b - 1.5, 1))
+            ustatus('asymmetric CFG: VRAM budget lowered to %.1f GB for the unconditional branch'
+                    % kw['vram_budget'])
         if quant != 'full':
             kw['transformer_path'] = '%s/%s' % (_rid(entry['gguf_repo_url']), quant)
             kw['prefetch'] = False
@@ -616,6 +631,23 @@ def _resample_schedule(seq, n):
         f = p - lo
         out.append(seq[lo] * (1 - f) + seq[hi] * f)
     return out
+def _shares_unconditional(pipe):
+    """True when the pipeline reuses the conditional transformer as the CFG negative branch.
+
+    Ideogram4 is trained with ASYMMETRIC classifier-free guidance: the negative
+    branch is a separately trained ``unconditional_transformer``.  When both
+    branches are the same model, the blend ``v = g*v_pos + (1-g)*v_neg``
+    amplifies the difference against the wrong reference and the sample drifts
+    completely off-prompt (coherent but unrelated images).  In that case the
+    guidance must stay at 1.0 (no amplification).
+    """
+    try:
+        p = getattr(pipe, '_pipeline', pipe)
+        t = getattr(p, 'transformer', None)
+        u = getattr(p, 'unconditional_transformer', None)
+        return t is not None and u is t
+    except Exception:
+        return False
 def _guidance_plan(pipe, a):
     """Decide the guidance kwargs for this run.
 
@@ -631,6 +663,14 @@ def _guidance_plan(pipe, a):
         if a['guid'] > 0 and _native_supports(pipe, 'guidance_scale'):
             return {'guidance_scale': float(a['guid'])}, 'scale'
         return {}, 'none'
+    if _shares_unconditional(pipe):
+        # No dedicated unconditional model -> never amplify the guidance.
+        if a['guid'] > 0:
+            ustatus('WARNING: no dedicated unconditional_transformer — guidance clamped to 1.0 '
+                    '(the CFG negative branch would otherwise point the wrong way).')
+            return {'guidance_scale': 1.0, 'guidance_schedule': None}, 'scale=1 (no unconditional model)'
+        base = sched if sched else list(_IDEOGRAM4_GUIDANCE_DEFAULT)
+        return {'guidance_schedule': [1.0] * n}, 'schedule=1 (no unconditional model)'
     if a['guid'] > 0:
         return {'guidance_scale': float(a['guid']), 'guidance_schedule': None}, 'scale'
     base = sched if sched else list(_IDEOGRAM4_GUIDANCE_DEFAULT)
@@ -808,12 +848,28 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
     pipe = PIPE_CACHE['pipe']
 
     # — phase 3: generate —
-    gstate, gbox = {'step': 0, 'total': a['steps']}, {}
+    gstate, gbox = {'step': 0, 'total': a['steps'], 't0': time.time(), 'last': time.time(),
+                     'rate': 0.0, 'eta': None, 'peak': 0.0}, {}
     def _cb(_p, i, _t, cb_kwargs):
         try:
             gstate['step'] = int(i) + 1
         except Exception:
             pass
+        _now = time.time()
+        _dt = max(1e-3, _now - gstate['last'])
+        gstate['last'] = _now
+        # Exponential moving average so the ETA settles quickly but stays stable.
+        gstate['rate'] = _dt if not gstate['rate'] else (0.6 * gstate['rate'] + 0.4 * _dt)
+        _left = max(0, gstate['total'] - gstate['step'])
+        gstate['eta'] = gstate['rate'] * _left
+        try:
+            gstate['peak'] = torch.cuda.max_memory_allocated() / 1e9
+        except Exception:
+            pass
+        if gstate['step'] % max(1, min(5, gstate['total'] // 10 or 1)) == 0 or _left == 0:
+            ustatus('step %d/%d · %.1fs/step · elapsed %.0fs · ETA %.0fs · peak %.2f GB'
+                    % (gstate['step'], gstate['total'], gstate['rate'],
+                       _now - gstate['t0'], gstate['eta'], gstate['peak']))
         return cb_kwargs
     gen_state.update(pct=1, txt='Generation — denoising 0/%d' % a['steps'])
     yield snap()
@@ -836,7 +892,12 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
     threading.Thread(target=_infer, daemon=True).start()
     while 'img' not in gbox and 'vid' not in gbox and 'error' not in gbox:
         pct = 100.0 * min(1.0, gstate['step'] / max(1, gstate['total']))
-        gen_state.update(pct=pct, txt='Generation — denoising %d/%d' % (min(gstate['step'], gstate['total']), gstate['total']))
+        _txt = 'Generation — denoising %d/%d' % (min(gstate['step'], gstate['total']), gstate['total'])
+        if gstate['eta'] is not None and gstate['step'] > 0:
+            _txt += ' · %.1fs/step · ETA %.0fs' % (gstate['rate'], gstate['eta'])
+        if gstate['peak']:
+            _txt += ' · peak %.2f GB' % gstate['peak']
+        gen_state.update(pct=pct, txt=_txt)
         yield snap()
         time.sleep(0.4)
     if 'error' in gbox:
@@ -861,7 +922,8 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
                 ustatus('WARNING: output is one flat color (classic NaN black-image failure) — re-run with dtype bfloat16.')
         except Exception:
             pass
-    ustatus('done in %.0fs · peak %.2f GB · seed %d' % (dt, peak, seed))
+    ustatus('done in %.0fs · %.1f s/step · peak %.2f GB · seed %d'
+            % (dt, gstate.get('rate') or 0.0, peak, seed))
     gen_state.update(pct=100, txt='Generation — done in %.0fs' % dt)
     _done_txt = 'Done in %.0fs · peak %.2f GB VRAM · seed %d' % (dt, peak, seed)
     _done_kind = 'ok'

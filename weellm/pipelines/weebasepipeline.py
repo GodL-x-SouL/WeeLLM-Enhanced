@@ -29,6 +29,21 @@ from weellm.io.memory import evict_module
 
 logger = logging.getLogger("weellm")
 
+
+def _has_weights(component_dir: Path) -> bool:
+    """True if *component_dir* actually contains model weights (not just configs)."""
+    try:
+        component_dir = Path(component_dir)
+        if not component_dir.is_dir():
+            return False
+        for pat in ("*.safetensors", "*.gguf", "*.bin", "*.pt"):
+            if any(component_dir.glob(pat)):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Text encoder class → module path mapping
 # ---------------------------------------------------------------------------
@@ -432,6 +447,47 @@ class WeeBasePipeline:
 
         if "unconditional_transformer" in index:
             diffusers_kwargs["unconditional_transformer"] = tr_model
+            # Ideogram4 trains with ASYMMETRIC classifier-free guidance: the
+            # negative branch must come from a separately trained
+            # `unconditional_transformer` (image-only, zeroed text features).
+            # Reusing the conditional model there makes the guidance blend
+            # amplify the wrong direction -> coherent but off-prompt images.
+            unc_dir = model_dir_path / "unconditional_transformer"
+            if _has_weights(unc_dir):
+                try:
+                    # Same streamer class as the conditional model, but reading the
+                    # unconditional weights from its own folder (no GGUF override).
+                    unc_cls = type(transformer_streamer)
+                    unc_streamer = unc_cls.from_pretrained(
+                        unc_dir, device=device, dtype=effective_dtype,
+                        prefetch=False, cache_to_ram=cache_to_ram,
+                    )
+                    unc_model = getattr(unc_streamer, "model", getattr(unc_streamer, "_model", unc_streamer))
+                    unc_model = cls._patch_to(unc_model)
+                    unc_model._weellm_streamer = unc_streamer
+                    diffusers_kwargs["unconditional_transformer"] = unc_model
+                    # Both transformers run once per step, so they share VRAM.
+                    # Never pin the unconditional blocks: they are re-read every
+                    # step and the conditional model owns the fast path.
+                    unc_streamer._calibration_done = True
+                    unc_streamer._cache_budget_bytes = 0
+                    unc_streamer._double_buffering_enabled = False
+                    logger.info(
+                        "Loaded dedicated unconditional_transformer (asymmetric CFG) from %s",
+                        unc_dir,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[WeeLLM] Could not load unconditional_transformer (%s) — the negative "
+                        "CFG branch will reuse the conditional transformer, which degrades quality.",
+                        e,
+                    )
+            else:
+                logger.warning(
+                    "[WeeLLM] No unconditional_transformer weights found in %s — the negative CFG "
+                    "branch will reuse the conditional transformer, which degrades quality.",
+                    unc_dir,
+                )
 
         # ── Instantiate pipeline ─────────────────────────────────────────
         logger.info("\n============================================================")
