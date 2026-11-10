@@ -48,6 +48,33 @@ class Ideogram4Transformer2DModelStreamer(BaseTransformerStreamer):
             if k in expected_keys and not k.startswith("layers.") and not k.startswith("transformer_blocks.")
         ]
 
+    @staticmethod
+    def _assert_split_attention_layout(model: nn.Module) -> None:
+        """Fail fast when diffusers still exposes the legacy fused Ideogram4 attention.
+
+        The Ideogram4 GGUF key-map (``weellm.io.ggufs.keymaps.transformers.ideogram4``)
+        rewrites the checkpoint's fused ``attention.qkv`` / ``attention.o`` tensors into
+        the canonical ``attention.to_q`` / ``to_k`` / ``to_v`` / ``to_out.0`` projections
+        that current diffusers expects.  Against the legacy fused module the load would
+        die deep inside accelerate with a cryptic
+        ``AttributeError: 'Ideogram4Attention' object has no attribute 'o'``.
+        """
+        blocks = getattr(model, "layers", None) or getattr(model, "transformer_blocks", None)
+        if not blocks:
+            return
+        attn = getattr(blocks[0], "attention", None)
+        if attn is None:
+            return
+        if hasattr(attn, "to_q") and hasattr(attn, "to_out"):
+            return
+        raise RuntimeError(
+            "The installed diffusers exposes the legacy fused Ideogram4 attention "
+            f"(attributes: {sorted(a for a in dir(attn) if a in ('qkv', 'o', 'to_q', 'to_out'))}). "
+            "WeeLLM maps the Ideogram4 GGUF checkpoint onto the canonical split layout "
+            "(attention.to_q/to_k/to_v + attention.to_out.0). "
+            "Upgrade diffusers: pip install -U git+https://github.com/huggingface/diffusers.git"
+        )
+
     def apply_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         """Override to apply FP8 dequantization (weight * scale) before placing on GPU."""
         processed_sd = {}
@@ -105,6 +132,8 @@ class Ideogram4Transformer2DModelStreamer(BaseTransformerStreamer):
         with default_dtype(dtype), init_empty_weights():
             model = diffusers.Ideogram4Transformer2DModel.from_config(config)
         model.eval()
+
+        self._assert_split_attention_layout(model)
 
         logger.info("Step 3/3 -- Loading resident transformer tensors to GPU ...")
         streamer = cls(model=model, seeker=seeker, device=device, dtype=dtype, prefetch=prefetch)

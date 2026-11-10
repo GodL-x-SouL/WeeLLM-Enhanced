@@ -26,6 +26,7 @@ from weellm.io.ggufs.keymaps.transformers.sdxl   import SDXLKeyMap
 from weellm.io.ggufs.keymaps.transformers.sd15   import SD15KeyMap
 from weellm.io.ggufs.keymaps.transformers.krea2  import Krea2KeyMap
 from weellm.io.ggufs.keymaps.transformers.zimage import ZImageKeyMap
+from weellm.io.ggufs.keymaps.transformers.ideogram4 import Ideogram4KeyMap
 from weellm.io.ggufs.keymaps.transformers.minimax_h3 import MiniMaxH3KeyMap
 from weellm.io.ggufs.keymaps.text_encoders.qwen3vl import Qwen3VLKeyMap
 from weellm.io.ggufs.keymaps.transformers.ltx25 import LTX25KeyMap
@@ -44,6 +45,7 @@ _REGISTRY = [
     SD15KeyMap,     # model.diffusion_model.* (no SDXL markers)
     Krea2KeyMap,    # txtfusion.* or blocks.0.attn.qknorm.*
     ZImageKeyMap,   # context_refiner.* / noise_refiner.*
+    Ideogram4KeyMap,# layers.*.attention.qkv.* + layers.*.attention.o.*
     Qwen3VLKeyMap,  # visual.blocks.* + model.layers.* (unsloth Qwen3VL TE GGUF)
     MiniMaxH3KeyMap,# blocks.* (MiniMax H3 checkpoint convention)
     LTX25KeyMap,     # ltxv native keys
@@ -89,6 +91,7 @@ __all__ = [
     "SD15KeyMap",
     "Krea2KeyMap",
     "ZImageKeyMap",
+    "Ideogram4KeyMap",
     "Qwen3VLKeyMap",
     "MiniMaxH3KeyMap",
     "LTX25KeyMap",
