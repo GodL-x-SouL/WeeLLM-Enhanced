@@ -49,7 +49,7 @@ MODELS = {
   fetch_patterns=['model_index.json', 'transformer/*.json', 'vae/*', 'audio_vae/*',
                   'text_encoder/config.json', 'tokenizer/*', 'processor/*',
                   'scheduler/*', 'audio_scheduler/*', '*.txt', '*.py'],
-  steps=6, guid=0.0, w=960, h=544, frames=73,
+  steps=6, guid=0.0, w=960, h=544, frames=124,
   ignore=[],
   quants=[
    ('MiniMax-H3-FL2VA-Pruned-Q4_K_M.gguf', 'Q4_K_M pruned · 11.6 GB · recommended', 'https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/blob/main/MiniMax-H3-FL2VA-Pruned-Q4_K_M.gguf'),
@@ -184,10 +184,10 @@ def on_task(task):
     first = opts[0][1] if opts else None
     e = MODELS[first]
     qdefault = [q[1] for q in e['quants'] if q[0] == e['default_q']][0]
-    return (gr.update(choices=opts, value=first), gr.update(choices=[q[1] for q in e['quants']], value=qdefault), gr.update(visible=(task in ('t2v', 'i2v'))), gr.update(visible=(task == 'i2v')), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 73)), model_hint(e))
+    return (gr.update(choices=opts, value=first), gr.update(choices=[q[1] for q in e['quants']], value=qdefault), gr.update(visible=(task in ('t2v', 'i2v'))), gr.update(visible=(task == 'i2v')), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 124)), model_hint(e))
 def on_model(model_key):
     e = MODELS[model_key]
-    return (gr.update(choices=[q[1] for q in e['quants']], value=[q[1] for q in e['quants'] if q[0] == e['default_q']][0]), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 73)), model_hint(e))
+    return (gr.update(choices=[q[1] for q in e['quants']], value=[q[1] for q in e['quants'] if q[0] == e['default_q']][0]), gr.update(value=e['steps']), gr.update(value=e['w']), gr.update(value=e['h']), gr.update(value=e.get('frames', 124)), model_hint(e))
 def model_hint(e):
     return ("<div style='font-size:12px;color:#8a8a95;line-height:1.5;'><a style='color:#aab4e8;' href='%s' target='_blank'>%s</a> · %s</div>" % (e['repo_url'], _rid(e['repo_url']), html.escape(e['access'])))
 
@@ -347,8 +347,11 @@ def _repo_bytes(repo, token, patterns=None, exclude=()):
 def _gguf_bytes(repo, filename, token):
     return _repo_bytes(repo, token, patterns=[filename])
 def _snap73(n):
-    n = max(9, int(n))
-    k = max(0, round((n - 5) / 17))
+    # MiniMax-H3 generates 5-15 s at 24 fps, and its video VAE only accepts
+    # 17k+5 frames -> 124..345.  73 (17*4+5) is too short and diffusers rejects
+    # it outright, so clamp into the supported window before snapping.
+    n = max(120, min(360, int(n)))
+    k = max(7, min(20, round((n - 5) / 17)))
     return 17 * k + 5
 def _snap121(n):
     n = max(9, int(n))
@@ -1218,7 +1221,7 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
     with _C(gr.Row, visible=False) as i2v_box:
         start_im = _C(gr.Image, type='pil', label='Start frame')
     with _C(gr.Row, visible=False) as vid_box:
-        frames_s = _C(gr.Slider, 9, 241, value=73, step=1, label='Frames (auto-snapped to the model)')
+        frames_s = _C(gr.Slider, 9, 360, value=124, step=1, label='Frames (auto-snapped to the model · MiniMax-H3: 124–345)')
     with _C(gr.Row):
         run_b = _C(gr.Button, 'Run', variant='primary', scale=4)
         unload_b = _C(gr.Button, 'Unload', variant='secondary', scale=1)
