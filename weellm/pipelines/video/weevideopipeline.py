@@ -67,7 +67,7 @@ class WeeVideoResult:
     A unified wrapper for generated video frames and audio (if any),
     mimicking the PIL.Image experience for video generation.
     """
-    def __init__(self, frames, audio=None, default_fps=24, audio_rate=48000):
+    def __init__(self, frames, audio=None, default_fps=24, audio_rate=48000, sampling_rate=None):
         # Un-nest if it's a list of lists (e.g. batch size 1 list of frames)
         while isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], list):
             frames = frames[0]
@@ -86,6 +86,7 @@ class WeeVideoResult:
         self.audio = audio
         self.default_fps = default_fps
         self.audio_rate = audio_rate
+        self.sampling_rate = int(sampling_rate or audio_rate)
 
     def save(self, filepath: str, fps: int = None, **kwargs):
         final_fps = fps if fps is not None else self.default_fps
@@ -425,7 +426,9 @@ class WeeVideoPipeline(WeeBasePipeline):
                 _cst.lora_loader = lazy_loader
                 logger.info("[LoRA] Attached to the connectors streamer.")
 
-        if _video_cache.has_final():
+        # Modular pipelines (MiniMax-H3) yield decoded PIL frames, not latents.
+        # Their cache entries are unusable and a decode hit would be garbage.
+        if _video_cache.has_final() and not hasattr(_underlying, "_blocks"):
             logger.info("[VideoCache] Final-latents cache HIT — running decode-only.")
             _cached_final = _video_cache.load_final()
             _cached_latents = _cached_final.get("latents")
@@ -556,7 +559,7 @@ class WeeVideoPipeline(WeeBasePipeline):
             if hasattr(out, "audio") and isinstance(out.audio, torch.Tensor):
                 _raw_audio = out.audio
                 
-            if _raw_latents is not None:
+            if _raw_latents is not None and not hasattr(_underlying, "_blocks"):
                 _save_dict = {"latents": _raw_latents.cpu()}
                 if _raw_audio is not None:
                     _save_dict["audio_latents"] = _raw_audio.cpu()
@@ -602,7 +605,9 @@ class WeeVideoPipeline(WeeBasePipeline):
         _audio = getattr(out, "audio", None)
         
         # If we have audio latents and a vocoder, manually decode
-        if _audio is not None and isinstance(_audio, torch.Tensor) and _audio.dim() > 2 and user_output_type != "latent":
+        if (_audio is not None and isinstance(_audio, torch.Tensor) and _audio.dim() > 2
+                and user_output_type != "latent"
+                and not getattr(out, "sampling_rate", None)):
             _audio_vae = getattr(_underlying, "audio_vae", None)
             _vocoder = getattr(_underlying, "vocoder", None)
             
@@ -632,6 +637,13 @@ class WeeVideoPipeline(WeeBasePipeline):
         _audio_rate = 48000
         if hasattr(_underlying, "vocoder") and hasattr(_underlying.vocoder, "config"):
             _audio_rate = getattr(_underlying.vocoder.config, "output_sampling_rate", 48000)
+        # MiniMax-H3 has no vocoder: its native state carries sampling_rate=32000.
+        # Reading it here prevents 32 kHz audio being muxed as 48 kHz (1.5x speed).
+        _native_rate = (getattr(out, "sampling_rate", None) or getattr(out, "audio_rate", None))
+        if not _native_rate and hasattr(_underlying, "audio_vae"):
+            _native_rate = getattr(getattr(_underlying.audio_vae, "config", None), "sampling_rate", None)
+        if _native_rate:
+            _audio_rate = int(_native_rate)
 
         # Return the wrapper if we successfully intercepted frames, otherwise return raw output
         if _frames is not None:
@@ -639,7 +651,8 @@ class WeeVideoPipeline(WeeBasePipeline):
                 frames=_frames,
                 audio=_audio,
                 default_fps=_fps,
-                audio_rate=_audio_rate
+                audio_rate=_audio_rate,
+                sampling_rate=_audio_rate
             )
             
         return out

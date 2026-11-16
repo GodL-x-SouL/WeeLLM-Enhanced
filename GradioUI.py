@@ -163,7 +163,7 @@ def ustatus(msg):
 def _fmt_gb(n):
     return '%.1f GB' % (n / 1e9) if n >= 1e9 else '%d MB' % (n / 1e6)
 def _sim_budgets():
-    return 12.5, 8.5  # preview defaults ≈ T4 runtime; no torch/psutil needed
+    return 12.5, 8.0  # preview defaults ≈ T4 runtime; no torch/psutil needed
 
 # ── minimal HTML fragments (in-app) ────────────────────────────
 def status_html(msg, kind='run'):
@@ -299,7 +299,7 @@ def _budgets():
     import psutil
     vram = torch.cuda.get_device_properties(0).total_memory / 1e9
     ram = psutil.virtual_memory().total / 1e9
-    return round(max(4.0, vram - 3.0), 1), round(max(4.0, min(10.0, ram - 4.0)), 1)
+    return round(max(4.0, vram - 3.0), 1), round(min(8.0, max(2.0, ram - 1.0)), 1)
 def _hub_dir(repo):
     from huggingface_hub import constants
     root = os.environ.get('HF_HUB_CACHE', constants.HF_HUB_CACHE)
@@ -868,14 +868,17 @@ def _run_video(pipe, entry, a, cb, use_cb):
         raise
 def _save_video_out(out, entry_label):
     from diffusers.utils import encode_video
-    if hasattr(out, 'videos') and out.videos is not None:
-        videos = out.videos[0] if isinstance(out.videos, list) else out.videos
-    elif hasattr(out, 'video') and out.video is not None:
-        videos = out.video[0] if isinstance(out.video, list) else out.video
-    elif hasattr(out, 'frames') and out.frames is not None:
-        videos = out.frames[0] if isinstance(out.frames, list) else out.frames
-    else:
+    videos = getattr(out, 'videos', None)
+    if videos is None:
+        videos = getattr(out, 'video', None)
+    if videos is None:
+        videos = getattr(out, 'frames', None)
+    if videos is None:
         raise RuntimeError('Unrecognized video output from %s' % entry_label)
+    # WeeVideoResult already flattens [[frame, ...]] to [frame, ...].  Stripping
+    # [0] again handed encode_video a single PIL image -> TypeError on save.
+    if isinstance(videos, list) and videos and isinstance(videos[0], list):
+        videos = videos[0]
     audio = getattr(out, 'audio', None)
     if isinstance(audio, list):
         audio = audio[0] if audio else None

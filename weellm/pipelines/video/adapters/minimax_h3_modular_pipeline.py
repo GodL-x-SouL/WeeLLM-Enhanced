@@ -28,14 +28,20 @@ class WeeMiniMaxPipeline(WeeVideoPipeline):
                     new_scheduler = self._pipeline.scheduler.__class__.from_config(self._pipeline.scheduler.config)
                     setattr(self._pipeline, _comp_name, new_scheduler)
                 else:
+                    _dev = getattr(self._pipeline, "device", "cpu")
                     class DummyComponent:
                         config = type('DummyConfig', (), {'latent_channels': 32, 'sampling_rate': 32000})()
                         def __call__(self, *args, **kwargs): return None
                         def encode(self, *args, **kwargs):
                             import torch
                             class Output:
-                                latent_dist = type('Dist', (), {'sample': lambda: torch.zeros(1, 32, 1).to(self._pipeline.device)})()
+                                latent_dist = type('Dist', (), {'sample': lambda: torch.zeros(1, 32, 1, device=_dev)})()
                             return Output()
+                        def decode(self, *args, **kwargs):
+                            # Modular MiniMax always decodes audio; a silent
+                            # [2, samples] waveform is safer than AttributeError.
+                            import torch
+                            return (torch.zeros(1, 2, 32000, device=_dev),)
                     setattr(self._pipeline, _comp_name, DummyComponent())
                 logger.debug(
                     "[WeeLLM] Patched None '%s' with dummy component.",

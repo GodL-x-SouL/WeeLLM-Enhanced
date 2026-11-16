@@ -82,6 +82,7 @@ class GenericLazyLoRALoader:
         self.scale        = scale
         self.config      = config
         self._skipped_keys: set[str] = set()
+        self._shape_mismatch_keys: set = set()
 
         # ----------------------------------------------------------------
         # Parse safetensors header without loading tensor data
@@ -233,6 +234,21 @@ class GenericLazyLoRALoader:
                             else:
                                 sub_delta = delta
                                 
+                            # A LoRA trained on the full model still contains
+                            # deltas for layers the pruned GGUF reinitialised
+                            # (e.g. adaln_proj.linear: 2688 -> 8 inputs).  They
+                            # cannot be merged; skip instead of crashing.
+                            if tuple(sub_delta.shape) != tuple(param.shape):
+                                _mk = (a_key, local_key)
+                                if _mk not in self._shape_mismatch_keys:
+                                    logger.warning(
+                                        "[LoRA] Shape mismatch for '%s': delta %s vs param %s - SKIPPED. "
+                                        "This LoRA targets a different base (full vs pruned).",
+                                        local_key, tuple(sub_delta.shape), tuple(param.shape))
+                                    self._shape_mismatch_keys.add(_mk)
+                                skipped_count += 1
+                                continue
+
                             param.data.add_(sub_delta.to(dtype=param.dtype))
                             applied_count += 1
 
@@ -242,13 +258,14 @@ class GenericLazyLoRALoader:
                         del sub_delta
 
                 except Exception as exc:
-                    logger.error(
-                        "[LoRA] Failed to apply delta for '%s': %s",
-                        valid_targets[0][1],
+                    # A bad LoRA must never take down the whole generation.
+                    logger.warning(
+                        "[LoRA] Skipped delta for '%s' after error: %s",
+                        valid_targets[0][1] if valid_targets else a_key,
                         exc,
-                        exc_info=True,
                     )
-                    raise
+                    skipped_count += 1
+                    continue
 
         if applied_count > 0 or skipped_count > 0:
             logger.info(

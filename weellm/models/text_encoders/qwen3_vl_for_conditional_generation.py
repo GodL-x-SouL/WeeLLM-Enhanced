@@ -247,7 +247,7 @@ class Qwen3VLForConditionalGenerationStreamer:
     def _reload_residents_if_meta(self):
         from weellm.models.text_encoders.full_load import has_meta_residents
 
-        if has_meta_residents(self._model, self._get_resident_keys(self._seeker)):
+        if has_meta_residents(self._model, _get_resident_keys(self._seeker)):
             self._load_resident_modules()
 
     def release_resident(self):
