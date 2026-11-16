@@ -95,7 +95,7 @@ class VideoStepCache:
     prompt:
         The text prompt.  Used as the sole key for the embeds cache so the
         same embeds are reused across different resolutions / step counts.
-    height, width, num_frames, steps, seed, lora_weights:
+    height, width, num_frames, steps, seed, lora_weights, lora_scale:
         Together with *prompt* these form the run key; any change busts the
         denoising cache (but not the embeds cache).
     save_every:
@@ -114,6 +114,7 @@ class VideoStepCache:
         steps: int,
         seed: int,
         lora_weights: Optional[str] = None,
+        lora_scale: float = 1.0,
         save_every: int = 1,
         cache_root: Optional[str] = None,
         model_id: Optional[str] = None,
@@ -129,7 +130,7 @@ class VideoStepCache:
         run_hash    = _sha1(
             prompt,
             str(height), str(width), str(num_frames), str(steps), str(seed), str(lora_weights),
-            str(model_id), str(conditioning),
+            str(lora_scale), str(model_id), str(conditioning),
         )
 
         self.embeds_dir = root / f"embeds_{prompt_hash}"

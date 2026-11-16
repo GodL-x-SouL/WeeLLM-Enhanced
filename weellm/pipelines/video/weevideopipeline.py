@@ -185,7 +185,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                 
         return latents
 
-    def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None, conditioning=None):
+    def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None, lora_scale=1.0, conditioning=None):
         from weellm.pipelines.video.video_cache import VideoStepCache
         if cache_root is None:
             cache_root = os.path.join(
@@ -199,6 +199,7 @@ class WeeVideoPipeline(WeeBasePipeline):
             steps=steps,
             seed=seed,
             lora_weights=lora_weights,
+            lora_scale=lora_scale,
             save_every=save_every,
             cache_root=cache_root,
             model_id=str(getattr(self, "model_dir", "") or getattr(self, "_model_id", "") or ""),
@@ -276,6 +277,7 @@ class WeeVideoPipeline(WeeBasePipeline):
         fresh = kwargs.pop("fresh", False)
         
         lora_weights = kwargs.pop("lora_weights", None)
+        lora_scale = float(kwargs.pop("lora_scale", 1.0))
         latent_upsampler = kwargs.pop("latent_upsampler", None)
         user_output_type = kwargs.get("output_type", "pil")
         
@@ -307,7 +309,8 @@ class WeeVideoPipeline(WeeBasePipeline):
 
         _video_cache = self._setup_cache(
             prompt, height, width, num_frames, steps, seed, save_every=cache_every,
-            lora_weights=lora_weights, conditioning=_conditioning_id(kwargs),
+            lora_weights=lora_weights, lora_scale=lora_scale,
+            conditioning=_conditioning_id(kwargs),
         )
         if fresh:
             _video_cache.clear_run()
@@ -402,7 +405,7 @@ class WeeVideoPipeline(WeeBasePipeline):
             from weellm.models.loras.lora_streamer import GenericLazyLoRALoader
             _tr_model = getattr(_underlying, "transformer", None) or getattr(_underlying, "unet", None)
             _cfg = getattr(_tr_model, "config", None)
-            lazy_loader = GenericLazyLoRALoader(lora_weights, config=_cfg)
+            lazy_loader = GenericLazyLoRALoader(lora_weights, scale=lora_scale, config=_cfg)
 
             # 1. Attach to the transformer streamer.  The blocks are streamed, so
             #    their weights are still on the meta device here: applying the

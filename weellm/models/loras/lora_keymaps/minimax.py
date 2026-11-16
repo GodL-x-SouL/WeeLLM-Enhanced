@@ -3,17 +3,29 @@ from typing import Set, List, Tuple, Any
 class MiniMaxH3LoRAKeyMap:
     NAME = "minimax_h3"
 
-    @staticmethod
-    def detect(lora_keys: Set[str]) -> bool:
-        # MiniMax LoRAs usually have "token_refiner" or just "blocks"
-        # We can also check inner_dim if needed, but checking for typical keys is fine
+    # Prefixes used by the various MiniMax-H3 LoRA releases (ComfyUI exports,
+    # PEFT exports, diffusers-native exports).  They all name the same blocks.
+    _STRIP_PREFIXES = ("diffusion_model.", "base_model.model.", "transformer.")
+
+    @classmethod
+    def _normalise(cls, key: str) -> str:
+        for p in cls._STRIP_PREFIXES:
+            if key.startswith(p):
+                key = key[len(p):]
+        return key
+
+    @classmethod
+    def detect(cls, lora_keys: Set[str]) -> bool:
         for k in lora_keys:
-            if k.startswith("token_refiner.blocks.") or k.startswith("blocks.") or ".mlp.fc1" in k:
+            n = cls._normalise(k)
+            if (n.startswith("token_refiner.blocks.") or n.startswith("blocks.")
+                    or n.startswith("transformer_blocks.")
+                    or ".mlp.fc1" in n or ".attn.qkv" in n):
                 return True
         return False
 
-    @staticmethod
-    def build_pairs(lora_keys: Set[str], config=None) -> List[Tuple[str, str, List[Tuple[str, Any]]]]:
+    @classmethod
+    def build_pairs(cls, lora_keys: Set[str], config=None) -> List[Tuple[str, str, List[Tuple[str, Any]]]]:
         pairs = []
         bases = set()
         for k in lora_keys:
@@ -26,8 +38,9 @@ class MiniMaxH3LoRAKeyMap:
             if a_key not in lora_keys or b_key not in lora_keys:
                 continue
 
-            # Original mapping logic from MiniMaxH3LoRALoader
-            name = base
+            # Original mapping logic from MiniMaxH3LoRALoader, but on the
+            # prefix-stripped name so ComfyUI/PEFT/diffusers exports all work.
+            name = cls._normalise(base)
             if name.startswith("token_refiner.blocks."):
                 target = name.replace("token_refiner.blocks.", "token_refiner.refiner_blocks.", 1)
             elif name.startswith("blocks."):
@@ -37,8 +50,8 @@ class MiniMaxH3LoRAKeyMap:
             target = target.replace("final_layer.adaln_proj.linear", "norm_out.linear")
 
             targets = []
-            if target.endswith(".attn.qkv_proj"):
-                prefix = target.removesuffix("qkv_proj")
+            if target.endswith(".attn.qkv_proj") or target.endswith(".attn.qkv"):
+                prefix = target.rsplit(".", 1)[0] + "."
                 # MiniMax stores the fused QKV PER-HEAD INTERLEAVED
                 # ([h0: q k v, h1: q k v, ...]), and so is the LoRA delta.
                 # The diffusers weights are contiguous thirds, so the delta has

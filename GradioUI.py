@@ -215,19 +215,19 @@ def _placeholder_image(seed, w, h):
 
 _RUN_LOCK = threading.Lock()
 
-def _sim_run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+def _sim_run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b, lora=None, lora_scale=1.0):
     if not _RUN_LOCK.acquire(blocking=False):
         yield status_html('Another run is already in progress — please wait for it to finish.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
         return
     try:
-        yield from _run_all_sim(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b)
+        yield from _run_all_sim(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b, lora, lora_scale)
     finally:
         _RUN_LOCK.release()
 
-def _run_all_sim(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+def _run_all_sim(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b, lora=None, lora_scale=1.0):
     entry = MODELS.get(model_key)
     if entry is not None:
-        _qmap = {lbl: val for val, lbl, _u in entry['quants']}
+        _qmap = {q[1]: q[0] for q in entry['quants']}
         quant = _qmap.get(quant, quant)
     if entry is None or not (prompt or '').strip():
         yield status_html('Pick a model and write a prompt first.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
@@ -406,13 +406,60 @@ def _quant_spec(entry, quant):
     GGUF for the separate negative-CFG model (Ideogram4); it is None when the
     quant is the full-precision release.
     """
-    repo = entry.get('gguf_repo_url')
+    # huggingface_hub rejects full URLs -- normalise every repo to namespace/name.
+    repo = _rid(entry.get('gguf_repo_url'))
     for q in entry.get('quants', []):
         if q[0] == quant and len(q) > 3 and q[3]:
-            repo = q[3]
-    unc_repo = entry.get('unc_gguf_repo_url') or repo
+            repo = _rid(q[3])
+    unc_repo = _rid(entry.get('unc_gguf_repo_url') or repo)
     unc_file = (entry.get('unc_gguf') or {}).get(quant)
     return repo, quant, unc_repo, unc_file
+
+
+def _resolve_lora(spec, token):
+    """Turn a LoRA input into a local .safetensors path.
+
+    Accepts a local path, a HF blob/resolve URL, a bare repo id, or
+    ``repo/filename.safetensors``.  A bare repo id picks its first safetensors
+    file.  Downloads through the usual HF cache, so reruns are instant.
+    """
+    spec = (spec or '').strip()
+    if not spec:
+        return None
+    if os.path.isfile(spec):
+        return spec
+    from huggingface_hub import hf_hub_download, HfApi
+    repo, filename = None, None
+    if 'huggingface.co/' in spec:
+        tail = spec.split('huggingface.co/', 1)[1].strip('/')
+        for marker in ('/blob/', '/resolve/'):
+            if marker in tail:
+                repo, filename = tail.split(marker, 1)
+                break
+        if repo is None:
+            repo = tail.split('/tree/', 1)[0]
+        if filename:
+            filename = filename.split('?', 1)[0]
+    elif '::' in spec:
+        repo, filename = spec.split('::', 1)
+    elif spec.endswith('.safetensors') and '/' in spec.strip('/'):
+        parts = spec.strip('/').split('/')
+        repo, filename = '/'.join(parts[:-1]), parts[-1]
+    else:
+        repo = spec.strip('/')
+    repo = _rid(repo) if repo else None
+    if not repo:
+        raise RuntimeError('Could not understand LoRA location: %s' % spec)
+    if not filename:
+        info = HfApi().model_info(repo, token=token or None)
+        cands = [s.rfilename for s in info.siblings if s.rfilename.endswith('.safetensors')]
+        if not cands:
+            raise RuntimeError('No .safetensors file in LoRA repo %s' % repo)
+        filename = cands[0]
+        ustatus('LoRA: using %s from %s' % (filename, repo))
+    path = hf_hub_download(repo_id=repo, filename=filename, token=token or None)
+    ustatus('LoRA: cached %s/%s -> %s' % (repo, filename, os.path.basename(path)))
+    return path
 
 
 def plan_download(entry, quant, token):
@@ -730,6 +777,8 @@ def _guidance_plan(pipe, a):
     return {'guidance_schedule': _resample_schedule(base, n)}, 'schedule(%d)' % n
 def _run_t2i(pipe, a, cb, use_cb):
     kw = dict(prompt=a['prompt'], height=a['h'], width=a['w'], num_inference_steps=a['steps'], seed=a['seed'])
+    if a.get('lora'):
+        ustatus('WARNING: LoRA is only wired into the video pipelines (MiniMax-H3 / LTX-2.5); ignoring it for this image model.')
     gk, gmode = _guidance_plan(pipe, a)
     kw.update(gk)
     ustatus('guidance mode: %s' % gmode)
@@ -760,6 +809,11 @@ def _run_video(pipe, entry, a, cb, use_cb):
         kw['image'] = a['start']
     if a['guid'] > 0:
         kw['guidance_scale'] = a['guid']
+    if a.get('lora'):
+        kw['lora_weights'] = a['lora']
+        ustatus('LoRA: %s (strength %.2f)' % (os.path.basename(a['lora']), float(a.get('lora_scale') or 1.0)))
+        if float(a.get('lora_scale') or 1.0) != 1.0:
+            kw['lora_scale'] = float(a['lora_scale'])
     if use_cb:
         kw['callback_on_step_end'] = cb
     try:
@@ -817,10 +871,10 @@ def _save_video_out(out, entry_label):
     return path
 
 # ── master generator (streams status · bars · logs · media) ────
-def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b, lora=None, lora_scale=1.0):
     entry = MODELS.get(model_key)
     if entry is not None:  # Dropdown returns the label — map it back to the quant value
-        _qmap = {lbl: val for val, lbl, _u in entry['quants']}
+        _qmap = {q[1]: q[0] for q in entry['quants']}
         quant = _qmap.get(quant, quant)
     if entry is None or not (prompt or '').strip():
         yield status_html('Pick a model and write a prompt first.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
@@ -835,7 +889,16 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
     if seed < 0:
         seed = random.randrange(2 ** 31 - 1)
     dtype = torch.float16 if dtype_name == 'float16' else torch.bfloat16
-    a = dict(prompt=prompt.strip(), neg=(neg or '').strip(), w=int(w), h=int(h), steps=int(steps), guid=float(guid or 0), seed=seed, frames=int(frames), start=start_img)
+    a = dict(prompt=prompt.strip(), neg=(neg or '').strip(), w=int(w), h=int(h), steps=int(steps), guid=float(guid or 0), seed=seed, frames=int(frames), start=start_img,
+             lora=None, lora_scale=float(lora_scale or 1.0))
+    if (lora or '').strip():
+        try:
+            a['lora'] = _resolve_lora(lora, token)
+        except Exception as _le:
+            _msg = 'LoRA setup failed - %s: %s' % (type(_le).__name__, _le)
+            ustatus(_msg)
+            yield status_html(_msg, 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
+            return
     if entry.get('supported') is False:
         _why = entry.get('unsupported_reason', 'This model cannot be loaded by WeeLLM yet.')
         ustatus('refused — ' + _why)
@@ -888,7 +951,10 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
     yield snap()
 
     # — phase 2: load (cached, instant on repeat runs) —
-    key = (model_key, quant, dtype_name, vram_b, ram_b)
+    # LoRA deltas are added in place to streamed block weights, so a cached
+    # pipeline would keep the PREVIOUS run's LoRA baked in.  Rebuild on change.
+    key = (model_key, quant, dtype_name, vram_b, ram_b,
+           a.get('lora') or '', float(a.get('lora_scale') or 1.0))
     if PIPE_CACHE['key'] != key or PIPE_CACHE['pipe'] is None:
         if PIPE_CACHE['pipe'] is not None:
             ustatus('pipeline config changed — rebuilding automatically, no manual unload needed.')
@@ -1003,14 +1069,14 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
 
 _RUN_LOCK = threading.Lock()
 
-def run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b):
+def run_all(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b, lora=None, lora_scale=1.0):
     # One run at a time: a second RUN click while downloading/loading would
     # build a whole second pipeline next to the first and OOM the box.
     if not _RUN_LOCK.acquire(blocking=False):
         yield status_html('Another run is already in progress — please wait for it to finish.', 'err'), bar_html(0, 'Download'), bar_html(0, 'Generation'), _log_text(), gr.skip(), gr.skip()
         return
     try:
-        yield from _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b)
+        yield from _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid, seed, frames, start_img, dtype_name, vram_b, ram_b, lora, lora_scale)
     finally:
         _RUN_LOCK.release()
 
@@ -1119,6 +1185,10 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
     with _C(gr.Accordion, 'Advanced', open=False):
         token_t = _C(gr.Textbox, label='HF token (gated repos — auto-loaded from Colab secrets)', type='password', value=_AUTO_TOKEN, placeholder='hf_…')
         neg_t = _C(gr.Textbox, label='Negative prompt', lines=1, placeholder='blurry, low quality')
+        lora_t = _C(gr.Textbox, label='LoRA weights (blank = none · video models only)', lines=1,
+                     placeholder='https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/blob/main/minimax_h3_turbo_4step.safetensors')
+        lora_scale_s = _C(gr.Slider, 0, 2, value=1.0, step=0.05, label='LoRA strength')
+        _C(gr.HTML, "<div style='font-size:11px;color:#8a8a95;line-height:1.5;'>Paste an HF file URL, a repo id, or a local <b>.safetensors</b> path. The 4-step MiniMax-H3 turbo LoRA pairs with <b>4 steps</b>; use a <b>pruned-compatible</b> LoRA with the pruned GGUF.</div>")
         with _C(gr.Row):
             w_s = _C(gr.Slider, 256, 2048, value=1024, step=16, label='Width')
             h_s = _C(gr.Slider, 256, 2048, value=1024, step=16, label='Height')
@@ -1136,7 +1206,7 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
     task_r.change(on_task, inputs=[task_r], outputs=[model_d, quant_d, vid_box, i2v_box, steps_s, w_s, h_s, frames_s, hint_h])
     model_d.change(on_model, inputs=[model_d], outputs=[quant_d, steps_s, w_s, h_s, frames_s, hint_h])
     unload_b.click(do_unload, inputs=[], outputs=[status_h])
-    _click_kw = dict(inputs=[task_r, model_d, quant_d, token_t, prompt_t, neg_t, w_s, h_s, steps_s, guid_s, seed_n, frames_s, start_im, dtype_r, vram_s, ram_s], outputs=[status_h, dl_h, gen_h, logs_t, img_o, vid_o])
+    _click_kw = dict(inputs=[task_r, model_d, quant_d, token_t, prompt_t, neg_t, w_s, h_s, steps_s, guid_s, seed_n, frames_s, start_im, dtype_r, vram_s, ram_s, lora_t, lora_scale_s], outputs=[status_h, dl_h, gen_h, logs_t, img_o, vid_o])
     try:
         run_b.click(run_all, concurrency_limit=1, **_click_kw)
     except TypeError:
