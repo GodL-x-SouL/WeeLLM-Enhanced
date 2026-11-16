@@ -234,8 +234,28 @@ class WeeBasePipeline:
         if transformer is not None and hasattr(transformer, "config"):
             if hasattr(transformer.config, "patch_size"):
                 patch_size = transformer.config.patch_size
-        
-        tokens = (est_h // vae_scale // patch_size) * (est_w // vae_scale // patch_size)
+
+        # MiniMax-H3 (and some other 3D transformers) declare patch_size as a
+        # sequence like [1, 2, 2] = (temporal, height, width), not a scalar.
+        # Integer-dividing by that list raised TypeError right before denoise.
+        ph = pw = 1
+        if isinstance(patch_size, (list, tuple)):
+            nums = [int(p) for p in patch_size if isinstance(p, (int, float))]
+            if len(nums) >= 2:
+                ph, pw = max(1, nums[-2]), max(1, nums[-1])
+            elif nums:
+                ph = pw = max(1, nums[0])
+        else:
+            try:
+                ph = pw = max(1, int(patch_size))
+            except Exception:
+                ph = pw = 1
+        try:
+            vae_scale = max(1, int(vae_scale))
+        except Exception:
+            vae_scale = 8
+
+        tokens = (est_h // vae_scale // ph) * (est_w // vae_scale // pw)
         
         # Estimate attention memory: roughly ~500KB per token based on SDPA overheads
         estimated_attention_bytes = tokens * 500 * 1024

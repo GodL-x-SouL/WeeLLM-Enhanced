@@ -1133,8 +1133,14 @@ if REAL:
         _lg = logging.getLogger(_lname)
         _lg.setLevel(logging.INFO)
         _lg.propagate = False
-        if not any(isinstance(h, _BusHandler) for h in _lg.handlers):
-            _lg.addHandler(_BusHandler())
+        # A previous run of this cell left a handler of the OLD _BusHandler
+        # class; isinstance() would not match it and every line appeared twice.
+        for _h in list(_lg.handlers):
+            if getattr(_h, '_weellm_bus', False) or type(_h).__name__ == '_BusHandler':
+                _lg.removeHandler(_h)
+        _h = _BusHandler()
+        _h._weellm_bus = True
+        _lg.addHandler(_h)
 else:
     _budgets = _sim_budgets
     do_unload = _sim_do_unload
