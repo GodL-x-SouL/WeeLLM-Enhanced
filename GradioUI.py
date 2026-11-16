@@ -3,6 +3,13 @@ it runs the real layer-streaming engine; without them it falls back to a simulat
 preview so the frontend can be inspected locally. Notebooks launch this file via
 serve() instead of embedding the UI source."""
 import os, time, random, threading, inspect, html, gc, traceback, fnmatch, logging, shutil
+# Set these BEFORE importing gradio: gradio_client imports huggingface_hub and
+# these are read at import time.  Hub v1+ ignores hf_transfer and sends large
+# files over Xet, which caps around 10 MB/s on Kaggle.  Plain HTTP is far faster.
+os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
+os.environ.setdefault('HF_XET_HIGH_PERFORMANCE', '1')
+os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
+os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '30')
 import gradio as gr
 
 # ── model registry (verbatim from the notebook) ───────────────
@@ -297,15 +304,23 @@ def _hub_dir(repo):
     from huggingface_hub import constants
     root = os.environ.get('HF_HUB_CACHE', constants.HF_HUB_CACHE)
     return os.path.join(root, 'models--' + repo.replace('/', '--'), 'blobs')
-_TEMP_SUFFIXES = ('.part', '.incomplete', '.lock', '.tmp')
 def _du(path):
+    """Bytes physically present in an HF cache blobs dir.
+
+    The Hub writes an in-flight transfer to ``<etag>.<uuid>.incomplete`` and
+    only renames it to the final blob when it finishes.  Those files MUST be
+    counted, otherwise the bar and the log stay frozen for the whole download
+    and then jump when a multi-GB file completes.
+    """
     t = 0
     for dp, _dn, fn in os.walk(path):
         for f in fn:
-            if f.startswith('tmp') or f.endswith(_TEMP_SUFFIXES):
-                continue  # in-flight transfer fragments, not real bytes yet
+            if f.endswith('.lock'):
+                continue
+            p = os.path.join(dp, f)
             try:
-                t += os.path.getsize(os.path.join(dp, f))
+                if os.path.isfile(p):
+                    t += os.path.getsize(p)
             except OSError:
                 pass
     return t
@@ -551,6 +566,9 @@ def _download_worker(plan, token, state):
         os.makedirs(bd, exist_ok=True)
         before[plan['repo']] = _du(bd)
         state['phase'] = 'snapshot'
+        ustatus('download started - %s' % plan.get('desc', ''))
+        _t0 = time.time()
+        _last_t, _last_got = _t0, 0
         box, done = {}, threading.Event()
         def _run():
             try:
@@ -574,10 +592,23 @@ def _download_worker(plan, token, state):
             got = _du(bd) - before[plan['repo']]
             for grepo, _gf in plan['ggufs']:
                 got += _du(_hub_dir(grepo)) - before[grepo]
-            state['got'] = max(0, got)
-            time.sleep(0.5)
+            got = max(0, got)
+            state['got'] = got
+            _now = time.time()
+            if _now - _last_t >= 5:
+                _dt = max(0.1, _now - _last_t)
+                _rate = max(0.0, (got - _last_got) / _dt)
+                _pct = 100.0 * min(1.0, got / max(1, plan['total']))
+                ustatus('download: %s / %s (%.0f%%) - %.1f MB/s - %.0fs elapsed'
+                        % (_fmt_gb(got), _fmt_gb(plan['total']), _pct,
+                           _rate / 1e6, _now - _t0))
+                _last_t, _last_got = _now, got
+            done.wait(0.5)
         if 'error' in box:
             raise box['error']
+        _dt = max(0.1, time.time() - _t0)
+        ustatus('download finished - %s in %.0fs (avg %.1f MB/s)'
+                % (_fmt_gb(state['got']), _dt, state['got'] / _dt / 1e6))
         state['snap'] = box.get('snap')
         state['done'] = True
     except Exception as e:
