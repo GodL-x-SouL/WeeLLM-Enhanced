@@ -429,17 +429,24 @@ def _resolve_lora(spec, token):
     if os.path.isfile(spec):
         return spec
     from huggingface_hub import hf_hub_download, HfApi
-    repo, filename = None, None
+    repo, filename, revision = None, None, None
     if 'huggingface.co/' in spec:
         tail = spec.split('huggingface.co/', 1)[1].strip('/')
+        rest = None
         for marker in ('/blob/', '/resolve/'):
             if marker in tail:
-                repo, filename = tail.split(marker, 1)
+                repo, rest = tail.split(marker, 1)
                 break
-        if repo is None:
+        if rest is None:
             repo = tail.split('/tree/', 1)[0]
-        if filename:
-            filename = filename.split('?', 1)[0]
+        else:
+            # URL is <repo>/blob/<revision>/<path/to/file>.  hf_hub_download
+            # adds the revision itself -- keeping it here gives main/main/...
+            rest = rest.split('?', 1)[0]
+            if '/' in rest:
+                revision, filename = rest.split('/', 1)
+            else:
+                filename = rest
     elif '::' in spec:
         repo, filename = spec.split('::', 1)
     elif spec.endswith('.safetensors') and '/' in spec.strip('/'):
@@ -457,7 +464,8 @@ def _resolve_lora(spec, token):
             raise RuntimeError('No .safetensors file in LoRA repo %s' % repo)
         filename = cands[0]
         ustatus('LoRA: using %s from %s' % (filename, repo))
-    path = hf_hub_download(repo_id=repo, filename=filename, token=token or None)
+    path = hf_hub_download(repo_id=repo, filename=filename,
+                           revision=revision or None, token=token or None)
     ustatus('LoRA: cached %s/%s -> %s' % (repo, filename, os.path.basename(path)))
     return path
 
