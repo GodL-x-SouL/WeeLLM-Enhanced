@@ -17,6 +17,27 @@ from weellm.pipelines.weebasepipeline import WeeBasePipeline
 logger = logging.getLogger("weellm")
 
 
+def _release_component_for_decode(component, evict_fn) -> None:
+    """Free VRAM before a VAE pass without destroying streamer residents.
+
+    ``evict_module`` moves *every* parameter to meta, including the resident
+    weights a streamer loads once at build time -- and streamers have no
+    reload path, so the next generation would fail on meta tensors.  Calling
+    ``release_cached_blocks`` frees the streamed blocks (the actual VRAM hogs)
+    and leaves residents intact.
+    """
+    if component is None:
+        return
+    streamer = getattr(component, "_weellm_streamer", None)
+    if streamer is not None and hasattr(streamer, "release_cached_blocks"):
+        try:
+            streamer.release_cached_blocks(reason="VAE decode offload")
+            return
+        except Exception:
+            pass
+    evict_fn(component)
+
+
 def _conditioning_id(kwargs: dict) -> Optional[str]:
     """Fingerprint the conditioning input (first frame / image).
 
@@ -440,7 +461,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                     from weellm.io.memory import evict_module as _evict
                     for _tr_name in ("transformer", "unet", "connectors"):
                         _tr = getattr(_underlying, _tr_name, None)
-                        if _tr is not None: _evict(_tr)
+                        _release_component_for_decode(_tr, _evict)
                         
                     gc.collect()
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -581,7 +602,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                     from weellm.io.memory import evict_module
                     for _comp in ["transformer", "text_encoder", "text_encoder_2", "text_encoder_3", "text_encoder_4", "connectors"]:
                         _c = getattr(_underlying, _comp, None)
-                        if _c: evict_module(_c)
+                        if _c: _release_component_for_decode(_c, evict_module)
                     gc.collect()
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
                     

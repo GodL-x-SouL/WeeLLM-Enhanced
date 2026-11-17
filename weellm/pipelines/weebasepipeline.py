@@ -277,7 +277,7 @@ class WeeBasePipeline:
                 transformer = getattr(self._pipeline, "unet", None)
             streamer = getattr(transformer, "_weellm_streamer", None)
             if streamer is not None and hasattr(streamer, "release_cached_blocks"):
-                streamer.release_cached_blocks()
+                streamer.release_cached_blocks(reason="retrying after CUDA OOM", recalibrate=False)
             raise
 
     def __getattr__(self, name: str):
@@ -1220,6 +1220,24 @@ class WeeBasePipeline:
                 torch.cuda.empty_cache()
             logger.debug("[WeeLLM Offload] Evicted %d tensors to meta (%s).", evicted, label)
 
+        def _release_for_vae(module, label: str) -> None:
+            """Free streamed blocks but keep a streamer's resident weights.
+
+            Evicting a whole streamed module to meta also drops the residents
+            that are loaded once at build time; streamers cannot reload them,
+            so the next generation would crash on meta tensors.
+            """
+            if module is None or not isinstance(module, torch.nn.Module):
+                return
+            streamer = getattr(module, "_weellm_streamer", None)
+            if streamer is not None and hasattr(streamer, "release_cached_blocks"):
+                try:
+                    streamer.release_cached_blocks(reason="VAE decode offload")
+                    return
+                except Exception:
+                    pass
+            _evict_module_to_meta(module, label)
+
         # TE eviction hook: runs on FIRST forward of transformer/unet
         def _evict_te_before_unet(module, args):
             if getattr(module, "_weellm_te_evicted", False):
@@ -1263,7 +1281,8 @@ class WeeBasePipeline:
                 if cuda_available:
                     torch.cuda.empty_cache()
                 report_memory("Before VAE Decode (After GC)")
-                _evict_module_to_meta(getattr(pipeline, "transformer", None), "transformer")
+                _release_for_vae(getattr(pipeline, "transformer", None), "transformer")
+                _release_for_vae(getattr(pipeline, "unet", None), "unet")
                 report_memory("Before VAE Decode (After Transformer Offload)")
 
                 # Cast float inputs (latents) to VAE's expected dtype

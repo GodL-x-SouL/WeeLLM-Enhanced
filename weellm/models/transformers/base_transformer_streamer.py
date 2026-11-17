@@ -320,12 +320,17 @@ class BaseTransformerStreamer(ABC):
         except TypeError:
             return self.seeker.get_tensors(keys, device="cpu", dtype=self.dtype)
 
-    def release_cached_blocks(self) -> int:
-        """Release streamed VRAM blocks after an allocation failure.
+    def release_cached_blocks(self, reason: str = "freeing VRAM", recalibrate: bool = True) -> int:
+        """Release streamed VRAM blocks without touching resident weights.
 
         The next forward pass will reload any required block through its
         normal hook. Resident model weights are not affected because only
         modules in ``_shard_order`` are visited.
+
+        ``recalibrate`` restores the double-buffering calibration so the next
+        generation can use background transfers again.  Set it to ``False``
+        when releasing after an OOM, where re-enabling would just repeat the
+        failure.
         """
         with self._lock:
             futures = list(self._h2d_futures.values())
@@ -333,6 +338,9 @@ class BaseTransformerStreamer(ABC):
             self._pinned_blocks.clear()
             self._cache_budget_bytes = 0
             self._double_buffering_enabled = False
+            if recalibrate:
+                self._db_calibration_done = False
+                self._double_buffering_enabled = True
 
         for future in futures:
             future.cancel()
@@ -359,9 +367,9 @@ class BaseTransformerStreamer(ABC):
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
 
-        logger.warning(
-            "[Streamer] Released %d streamed tensors after CUDA OOM; retrying without VRAM cache.",
-            released,
+        logger.info(
+            "[Streamer] Released %d streamed tensors (%s).",
+            released, reason,
         )
         return released
 
