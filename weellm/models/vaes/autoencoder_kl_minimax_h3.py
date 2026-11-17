@@ -357,6 +357,7 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
 
         t0 = time.time()
         read_bytes = 0
+        all_saved = True
         try:
             for start in range(0, n_pin, _PIN_BATCH_BLOCKS):
                 batch = list(range(start, min(start + _PIN_BATCH_BLOCKS, n_pin)))
@@ -409,11 +410,19 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
                         "folder to fast local storage (e.g. /content) also fixes this.",
                         rate / 2**20, self._fast_cache_dir(),
                     )
+                    # The rate is only measurable after the first batch, so the
+                    # blocks already resident still need writing or the cache
+                    # would be missing its first files for ever.
+                    for i in range(start):
+                        all_saved &= self._save_block_cache(
+                            f"decoder.transformer_blocks.{i}")
                 if saving:
                     for i in batch:
-                        self._save_block_cache(f"decoder.transformer_blocks.{i}")
+                        all_saved &= self._save_block_cache(
+                            f"decoder.transformer_blocks.{i}")
         finally:
-            if saving and len(self._pinned_prefixes) == n_pin and not few:
+            if (saving and all_saved and len(self._pinned_prefixes) == n_pin
+                    and not few):
                 self._finalize_fast_cache(self._n_blocks)
 
         if len(self._pinned_prefixes) == len(sizes):
