@@ -7,6 +7,7 @@ diffusers MiniMax components to WeeLLM layer-by-layer streamers.
 """
 
 import logging
+import torch
 from weellm.pipelines.video.weevideopipeline import WeeVideoPipeline
 
 logger = logging.getLogger("weellm")
@@ -14,6 +15,16 @@ logger = logging.getLogger("weellm")
 class WeeMiniMaxPipeline(WeeVideoPipeline):
     
     def __call__(self, prompt: str, **kwargs):
+        # MiniMaxH3Scheduler counts SIGMA GRID POINTS, not model evaluations:
+        # set_timesteps(n) keeps the terminal 0 and drives n-1 forwards.  The
+        # studio (and the 4-step turbo LoRA) mean evaluations, so requesting
+        # "4 steps" used to run only 3.  Ask for one extra grid point.
+        _steps = kwargs.get("num_inference_steps")
+        if _steps is not None:
+            try:
+                kwargs["num_inference_steps"] = int(_steps) + 1
+            except (TypeError, ValueError):
+                pass
         # Pick a safe attention path BEFORE the packed sequence is built.
         # bf16 on pre-Ampere GPUs has no memory-efficient SDPA kernel, so the
         # math backend would materialise a [heads, rows, rows] fp32 matrix
@@ -76,3 +87,48 @@ class WeeMiniMaxPipeline(WeeVideoPipeline):
         
         # 3. Delegate to the shared generic video generation loop in the base class
         return super().__call__(prompt=prompt, **kwargs)
+
+    # ── decode hooks ─────────────────────────────────────────────
+    # MiniMax-H3 latents are normalized with per-channel `latents_mean` /
+    # `latents_std` (NOT scaling_factor/shift_factor), and its VAE decodes
+    # into ImageNet-normalized RGB.  The modular pipeline's own decode step
+    # does both conversions; when the studio decodes manually (to control
+    # VRAM) it has to reproduce them exactly or the video comes out washed
+    # out / wrongly coloured.
+    def _preprocess_latents_for_decode(self, latents, vae, kwargs):
+        cfg = getattr(vae, "config", None)
+        mean = getattr(cfg, "latents_mean", None)
+        std = getattr(cfg, "latents_std", None)
+        if mean is None or std is None:
+            return super()._preprocess_latents_for_decode(latents, vae, kwargs)
+        try:
+            m = torch.tensor(mean, device=latents.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+            s = torch.tensor(std, device=latents.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+            if m.numel() != latents.shape[1]:
+                return super()._preprocess_latents_for_decode(latents, vae, kwargs)
+            return (latents.float() * s + m).to(latents.dtype)
+        except Exception as e:
+            logger.warning("[MiniMax-H3] latent denormalisation skipped (%s).", e)
+            return super()._preprocess_latents_for_decode(latents, vae, kwargs)
+
+    def _postprocess_decoded_video(self, video, vae, kwargs):
+        try:
+            if video.dim() == 5:
+                under = getattr(self, "_pipeline", self)
+                # The MiniMax processor is built with do_normalize=False and
+                # the decode step reverts ImageNet normalization itself.  Only
+                # do it here when the processor is not already doing it.
+                cfg = getattr(getattr(under, "video_processor", None), "config", None)
+                try:
+                    do_norm = bool(cfg.get("do_normalize", False)) if cfg is not None else False
+                except Exception:
+                    do_norm = False
+                if not do_norm:
+                    mean = getattr(under, "pixel_mean", (0.485, 0.456, 0.406))
+                    std = getattr(under, "pixel_std", (0.229, 0.224, 0.225))
+                    m = torch.tensor(mean, device=video.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+                    s = torch.tensor(std, device=video.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+                    video = (video.float() * s + m).clamp(0, 1)
+        except Exception as e:
+            logger.warning("[MiniMax-H3] ImageNet denormalisation skipped (%s).", e)
+        return super()._postprocess_decoded_video(video, vae, kwargs)

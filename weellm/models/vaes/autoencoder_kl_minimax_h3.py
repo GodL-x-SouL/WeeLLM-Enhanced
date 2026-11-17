@@ -1,6 +1,8 @@
+import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Union
@@ -19,6 +21,18 @@ logger = logging.getLogger("weellm")
 # decoder works on 256x256 spatial tiles, so activations are small; 2 GiB is
 # generous even at 960x544.
 _PIN_RESERVE_BYTES = 2 << 30
+
+# Blocks read per seeker call.  One call per block meant 36 file opens and 36
+# seek patterns; consecutive blocks live next to each other in the shard, so
+# batching them turns the pin into a few nearly-sequential reads.  Four blocks
+# is 512 MiB of fp32 source in flight — small enough for an 8 GB host.
+_PIN_BATCH_BLOCKS = 4
+
+# Below this measured read rate the source is clearly slow storage (Drive,
+# network mount) and the fp16 sidecar cache is worth building.
+_PIN_CACHE_MIN_RATE = 80 << 20
+
+_HEARTBEAT_SECONDS = 15.0
 
 
 class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
@@ -40,7 +54,9 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
     pass gets the full VRAM budget back.
 
     Set ``WEELLM_VAE_PIN=0`` to force streaming, or ``WEELLM_VAE_PIN_GB=<n>``
-    to cap the pin budget explicitly.
+    to cap the pin budget explicitly.  ``WEELLM_VAE_PIN_CACHE`` controls the
+    fp16 sidecar cache (``auto`` by default: built only when the checkpoint
+    reads slower than 80 MiB/s; ``1`` always, ``0`` never).
     """
 
     def __init__(
@@ -57,8 +73,13 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
         self._call_counter: int = 0
         self._decode_pass_calls: int = 0
         self._decode_passes: int = 0
+        self._decode_passes_total: int = 0
         self._n_blocks: int = 0
         self._pinned_prefixes: set = set()
+        self._decode_t0: float = 0.0
+        self._hb_stop = None
+        self._hb_thread = None
+        self._hb_label = "working"
 
         self._install_decoder_hooks()
         self._patch_encode()
@@ -104,6 +125,148 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
             total += b.numel() * (itemsize if b.is_floating_point() else b.element_size())
         return total
 
+    # ── heartbeat ─────────────────────────────────────────────────
+    # Loading 4.5 GiB and decoding 100+ passes can take minutes on slow
+    # storage / a T4.  A quiet log for that long looks like a hang, so a
+    # background thread reports progress even while the main thread blocks.
+    def _start_heartbeat(self, label: str) -> None:
+        self._stop_heartbeat()
+        self._hb_label = label
+        self._hb_stop = threading.Event()
+        t0 = time.time()
+
+        def _beat():
+            while not self._hb_stop.wait(_HEARTBEAT_SECONDS):
+                try:
+                    if torch.cuda.is_available():
+                        used = torch.cuda.memory_allocated() / 2**30
+                        resv = torch.cuda.memory_reserved() / 2**30
+                    else:
+                        used = resv = 0.0
+                    logger.info(
+                        "    [VAE Streamer] still %s · %.0fs elapsed · pinned %d/%d blocks · "
+                        "pass %d/%d · VRAM %.2f/%.2f GiB",
+                        self._hb_label, time.time() - t0,
+                        len(self._pinned_prefixes), self._n_blocks,
+                        self._decode_passes, self._decode_passes_total or 0,
+                        used, resv,
+                    )
+                except Exception:
+                    pass
+
+        self._hb_thread = threading.Thread(
+            target=_beat, daemon=True, name="weellm-vae-heartbeat")
+        self._hb_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        ev, th = self._hb_stop, self._hb_thread
+        if ev is not None:
+            ev.set()
+        if th is not None and th.is_alive():
+            th.join(timeout=2.0)
+        self._hb_stop = None
+        self._hb_thread = None
+
+    # ── optional fp16 sidecar cache ───────────────────────────────
+    def _fast_cache_dir(self) -> Path:
+        root = os.environ.get("WEELLM_VAE_CACHE_DIR") or os.path.join(
+            os.getcwd(), ".weellm_cache")
+        return Path(root) / "vae_decoder_fp16"
+
+    def _source_manifest(self):
+        """Fingerprint the checkpoint so a stale cache is never reused.
+
+        Always keyed on the whole decoder, not on the number of blocks that
+        happen to fit this run: a smaller pin budget can still load a prefix
+        of a cache built when all blocks fit.
+        """
+        try:
+            model_dir = Path(str(getattr(self.seeker, "model_dir", "") or ""))
+            shards = sorted({str(v) for v in getattr(self.seeker, "weight_map", {}).values()})
+            files = []
+            for src in shards:
+                p = model_dir / src
+                st = p.stat()
+                files.append([src.replace("\\", "/"), int(st.st_size), int(st.st_mtime)])
+            keys = []
+            for i in range(self._n_blocks):
+                keys.extend(self._get_block_keys(f"decoder.transformer_blocks.{i}"))
+            return {
+                "version": 1,
+                "dtype": str(self.dtype),
+                "n_blocks": int(self._n_blocks),
+                "files": files,
+                "keys_sha1": hashlib.sha1("\n".join(keys).encode()).hexdigest(),
+            }
+        except Exception:
+            return None
+
+    def _fast_cache_ready(self, n_blocks: int) -> bool:
+        d = self._fast_cache_dir()
+        manifest = d / "manifest.json"
+        try:
+            if not manifest.exists():
+                return False
+            stored = json.loads(manifest.read_text())
+            current = self._source_manifest()
+            if current is None or stored != current:
+                return False
+            return all((d / f"block_{i:02d}.pt").exists() for i in range(n_blocks))
+        except Exception:
+            return False
+
+    def _load_fast_cache(self, n_blocks: int) -> int:
+        d = self._fast_cache_dir()
+        loaded = 0
+        for i in range(n_blocks):
+            sd = torch.load(d / f"block_{i:02d}.pt", map_location="cpu")
+            for name, tensor in sd.items():
+                self._place_tensor(name, tensor, self.device, self.dtype)
+            del sd
+            self._pinned_prefixes.add(f"decoder.transformer_blocks.{i}")
+            loaded += 1
+        return loaded
+
+    def _block_module(self, prefix: str):
+        mod = self.model
+        for part in prefix.split("."):
+            mod = getattr(mod, part)
+        return mod
+
+    def _save_block_cache(self, prefix: str) -> bool:
+        try:
+            d = self._fast_cache_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            mod = self._block_module(prefix)
+            sd = {}
+            for name, p in mod.named_parameters():
+                sd[f"{prefix}.{name}"] = p.detach().to("cpu")
+            for name, b in mod.named_buffers():
+                sd[f"{prefix}.{name}"] = b.detach().to("cpu")
+            idx = int(prefix.rsplit(".", 1)[1])
+            tmp = d / f"block_{idx:02d}.tmp"
+            torch.save(sd, tmp)
+            os.replace(tmp, d / f"block_{idx:02d}.pt")
+            return True
+        except Exception as e:
+            logger.warning("    [VAE Streamer] Could not write fp16 decoder cache: %s", e)
+            return False
+
+    def _finalize_fast_cache(self, n_blocks: int) -> None:
+        manifest = self._source_manifest()
+        if manifest is None:
+            return
+        try:
+            (self._fast_cache_dir() / "manifest.json").write_text(json.dumps(manifest))
+            logger.info(
+                "    [VAE Streamer] Saved fp16 decoder cache (%d blocks) to %s — "
+                "the next run loads it instead of the slow source.",
+                n_blocks, self._fast_cache_dir(),
+            )
+        except Exception as e:
+            logger.warning("    [VAE Streamer] Could not finalize fp16 decoder cache: %s", e)
+
+    # ── pinning ───────────────────────────────────────────────────
     def _pin_decoder_blocks(self) -> int:
         """Load every decoder block that fits in free VRAM; return the count.
 
@@ -124,6 +287,8 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
             return 0
 
         sizes = [self._block_bytes(b) for b in blocks]
+        # Account for blocks the allocator is still holding before deciding.
+        clean_memory(self.device)
         try:
             free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
         except Exception:
@@ -149,53 +314,118 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
             "    [VAE Streamer] VRAM %.2f/%.2f GiB free before decode — pinning %d/%d decoder blocks (%.2f GiB).",
             free_bytes / 2**30, total_bytes / 2**30, n_pin, len(sizes), acc / 2**30,
         )
+        src_dir = getattr(self.seeker, "model_dir", None)
+        if src_dir:
+            logger.info("    [VAE Streamer] decoder weights: %s", src_dir)
         if n_pin == 0:
             logger.warning(
                 "    [VAE Streamer] Not enough free VRAM to pin a single block — "
-                "falling back to per-forward disk streaming (slow)."
+                "falling back to per-forward disk streaming.  That is HOURS at this "
+                "resolution: lower frames/resolution, or free VRAM first."
             )
             return 0
 
-        for i in range(n_pin):
-            prefix = f"decoder.transformer_blocks.{i}"
+        all_sizes = sum(sizes[:n_pin])
+        few = n_pin < len(sizes)
+
+        # Fast path: a validated fp16 copy written by a previous run.
+        if self._fast_cache_ready(n_pin):
+            logger.info(
+                "    [VAE Streamer] Found fp16 decoder cache at %s — loading from it "
+                "instead of the slow checkpoint.", self._fast_cache_dir())
+            t0 = time.time()
             try:
-                keys = self._get_block_keys(prefix)
-                try:
-                    # Pinned blocks live in VRAM for the whole decode; caching
-                    # their raw bytes in RAM would evict useful entries.
-                    sd = self.seeker.get_tensors(
-                        keys, device=self.device, dtype=self.dtype, use_cache=False)
-                except TypeError:
-                    sd = self.seeker.get_tensors(keys, device=self.device, dtype=self.dtype)
-                for name, tensor in sd.items():
-                    self._place_tensor(name, tensor, self.device, self.dtype)
-                del sd
-                self._pinned_prefixes.add(prefix)
-            except torch.cuda.OutOfMemoryError:
-                clean_memory(self.device)
-                logger.warning(
-                    "    [VAE Streamer] OOM while pinning block %d — keeping the %d that fit.",
-                    i, len(self._pinned_prefixes),
+                loaded = self._load_fast_cache(n_pin)
+                logger.info(
+                    "    [VAE Streamer] Loaded %d/%d decoder blocks from cache in %.1fs "
+                    "(%.0f MiB/s).",
+                    loaded, n_pin, time.time() - t0, all_sizes / 2**20 / max(0.1, time.time() - t0),
                 )
-                break
+                return loaded
             except Exception as e:
                 logger.warning(
-                    "    [VAE Streamer] Could not pin block %d (%s) — keeping the %d that fit.",
-                    i, e, len(self._pinned_prefixes),
+                    "    [VAE Streamer] fp16 decoder cache is unreadable (%s) — "
+                    "rebuilding from the checkpoint.", e)
+                self._release_pinned_blocks()
+
+        cache_mode = os.environ.get("WEELLM_VAE_PIN_CACHE", "auto").strip().lower()
+        saving = cache_mode == "1"
+        if cache_mode == "0":
+            saving = False
+        if few:
+            saving = False
+
+        t0 = time.time()
+        read_bytes = 0
+        try:
+            for start in range(0, n_pin, _PIN_BATCH_BLOCKS):
+                batch = list(range(start, min(start + _PIN_BATCH_BLOCKS, n_pin)))
+                keys = []
+                for i in batch:
+                    keys.extend(self._get_block_keys(f"decoder.transformer_blocks.{i}"))
+                try:
+                    try:
+                        # Pinned blocks live in VRAM for the whole decode; the
+                        # raw fp32 bytes would not fit the RAM cache anyway.
+                        sd = self.seeker.get_tensors(
+                            keys, device=self.device, dtype=self.dtype, use_cache=False)
+                    except TypeError:
+                        sd = self.seeker.get_tensors(keys, device=self.device, dtype=self.dtype)
+                    for name, tensor in sd.items():
+                        self._place_tensor(name, tensor, self.device, self.dtype)
+                    del sd
+                except torch.cuda.OutOfMemoryError:
+                    clean_memory(self.device)
+                    logger.warning(
+                        "    [VAE Streamer] OOM while pinning blocks %d-%d — keeping the %d that fit.",
+                        batch[0], batch[-1], len(self._pinned_prefixes),
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "    [VAE Streamer] Could not pin blocks %d-%d (%s) — keeping the %d that fit.",
+                        batch[0], batch[-1], e, len(self._pinned_prefixes),
+                    )
+                    break
+
+                for i in batch:
+                    self._pinned_prefixes.add(f"decoder.transformer_blocks.{i}")
+                read_bytes += sum(sizes[i] for i in batch)
+                elapsed = max(1e-6, time.time() - t0)
+                rate = read_bytes / elapsed
+                eta = max(0.0, (all_sizes - read_bytes) / max(1.0, rate))
+                logger.info(
+                    "    [VAE Streamer] pinned %d/%d blocks · %.2f GiB · %.1f MiB/s · "
+                    "%.0fs elapsed · ETA %.0fs",
+                    len(self._pinned_prefixes), n_pin, read_bytes / 2**30,
+                    rate / 2**20, elapsed, eta,
                 )
-                break
-            if (i + 1) % 6 == 0 or (i + 1) == n_pin:
-                logger.info("    [VAE Streamer] pinned decoder blocks %d/%d", i + 1, n_pin)
+
+                if cache_mode == "auto" and not saving and rate < _PIN_CACHE_MIN_RATE:
+                    saving = True
+                    logger.info(
+                        "    [VAE Streamer] source reads at %.1f MiB/s (slow storage) — "
+                        "writing an fp16 cache to %s for the next run.  Moving the model "
+                        "folder to fast local storage (e.g. /content) also fixes this.",
+                        rate / 2**20, self._fast_cache_dir(),
+                    )
+                if saving:
+                    for i in batch:
+                        self._save_block_cache(f"decoder.transformer_blocks.{i}")
+        finally:
+            if saving and len(self._pinned_prefixes) == n_pin and not few:
+                self._finalize_fast_cache(self._n_blocks)
 
         if len(self._pinned_prefixes) == len(sizes):
             logger.info(
-                "    [VAE Streamer] All %d decoder blocks resident in VRAM (%.2f GiB) — "
+                "    [VAE Streamer] All %d decoder blocks resident in VRAM (%.2f GiB) after %.0fs — "
                 "decode no longer touches the disk.",
-                len(sizes), acc / 2**30,
+                len(sizes), acc / 2**30, time.time() - t0,
             )
         else:
             logger.warning(
-                "    [VAE Streamer] Only %d/%d decoder blocks pinned — the remaining %d still stream from disk.",
+                "    [VAE Streamer] Only %d/%d decoder blocks pinned — the remaining %d still "
+                "stream from disk.  That can turn a 1 minute decode into hours.",
                 len(self._pinned_prefixes), len(sizes), len(sizes) - len(self._pinned_prefixes),
             )
         return len(self._pinned_prefixes)
@@ -229,28 +459,30 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
 
     def _block_post_hook(self, module: nn.Module, args, output):
         shard_prefix = getattr(module, "_vae_shard_prefix", None)
-        if shard_prefix in self._pinned_prefixes:
-            # Residency is managed for the whole decode; nothing to evict.
-            return output
-
-        # Evict block weights from GPU — CPU has no cache so this is final
-        self._evict_keys(getattr(module, "_vae_loaded_keys", []))
-        module._vae_loaded_keys = []
+        if shard_prefix not in self._pinned_prefixes:
+            # Streaming fallback: the block goes back to meta after this use.
+            self._evict_keys(getattr(module, "_vae_loaded_keys", []))
+            module._vae_loaded_keys = []
 
         # One "pass" = all 36 blocks once = one spatial tile / temporal clip.
         self._decode_pass_calls += 1
         if self._n_blocks and self._decode_pass_calls % self._n_blocks == 0:
             self._decode_passes += 1
             if self._decode_passes % 15 == 0:
-                if torch.cuda.is_available():
-                    used = torch.cuda.memory_allocated() / 1e9
-                    resv = torch.cuda.memory_reserved() / 1e9
-                    logger.info(
-                        "    [VAE Streamer] streamed pass %d · VRAM %.2f/%.2f GB",
-                        self._decode_passes, used, resv,
-                    )
-                else:
-                    logger.info("    [VAE Streamer] streamed pass %d", self._decode_passes)
+                elapsed = max(0.0, time.time() - self._decode_t0) if self._decode_t0 else 0.0
+                per = elapsed / max(1, self._decode_passes)
+                try:
+                    vram = " · VRAM %.2f/%.2f GiB" % (
+                        torch.cuda.memory_allocated() / 2**30,
+                        torch.cuda.memory_reserved() / 2**30,
+                    ) if torch.cuda.is_available() else ""
+                except Exception:
+                    vram = ""
+                logger.info(
+                    "    [VAE Streamer] pass %d/%d · %.0fs elapsed · %.2f s/pass%s",
+                    self._decode_passes, self._decode_passes_total or 0,
+                    elapsed, per, vram,
+                )
         return output
 
     def _patch_encode(self) -> None:
@@ -376,28 +608,41 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
                         legacy,
                     )
 
-            n_pinned = self._pin_decoder_blocks()
+            # Plan first: the pin can take minutes on slow storage, and the
+            # pass count tells the user exactly how much work is coming.
             plan = self._decode_plan(latents)
-            logger.info(
-                "    [VAE Streamer] decode plan: %d latent frames -> %d temporal clips x %d spatial "
-                "tiles = %d passes at %dx%d · %d/%d decoder blocks in VRAM",
-                plan["latent_frames"], plan["clips"], plan["tiles"], plan["passes"],
-                plan["width"], plan["height"], n_pinned, self._n_blocks,
-            )
-
-            report_memory("Before VAE decode")
+            self._decode_passes_total = plan["passes"]
             self._decode_pass_calls = 0
             self._decode_passes = 0
-            t0 = time.time()
+            logger.info(
+                "    [VAE Streamer] decode plan: %d latent frames -> %d temporal clips x %d spatial "
+                "tiles = %d decoder passes at %dx%d.",
+                plan["latent_frames"], plan["clips"], plan["tiles"], plan["passes"],
+                plan["width"], plan["height"],
+            )
+
+            self._start_heartbeat("loading decoder blocks")
+            n_pinned = 0
             try:
+                n_pinned = self._pin_decoder_blocks()
+                self._hb_label = "decoding"
+                logger.info(
+                    "    [VAE Streamer] %d/%d decoder blocks in VRAM · starting %d passes.",
+                    n_pinned, self._n_blocks, plan["passes"],
+                )
+
+                report_memory("Before VAE decode")
+                self._decode_t0 = time.time()
+                t0 = self._decode_t0
                 with torch.no_grad():
                     out = self.model.decode(latents.to(self.dtype), return_dict=False)
                     # out is a tuple; out[0] is the decoded video tensor
                     result = out[0] if isinstance(out, (tuple, list)) else out
+                elapsed = time.time() - t0
             finally:
+                self._stop_heartbeat()
                 self._release_pinned_blocks()
 
-            elapsed = time.time() - t0
             per_pass = elapsed / max(1, plan["passes"])
             report_memory("After VAE decode")
             logger.info(

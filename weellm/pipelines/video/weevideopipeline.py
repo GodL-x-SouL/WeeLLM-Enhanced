@@ -207,6 +207,42 @@ class WeeVideoPipeline(WeeBasePipeline):
                 
         return latents
 
+    def _postprocess_decoded_video(self, video, vae, kwargs):
+        """Hook for model-specific pixel postprocessing after VAE decode.
+
+        Base implementation just hands the decoded tensor to the pipeline's
+        video processor.  Models whose VAE emits normalized RGB override this
+        to undo the normalization first.
+        """
+        _underlying = getattr(self, "_pipeline", self)
+        _vproc = getattr(_underlying, "video_processor", None)
+        return _vproc.postprocess_video(video, output_type="pil") if _vproc else video
+
+    def _preprocess_audio_latents(self, latents, vae):
+        """Undo per-channel latent normalization for audio VAEs that use it."""
+        cfg = getattr(vae, "config", None)
+        mean = getattr(cfg, "latents_mean", None)
+        std = getattr(cfg, "latents_std", None)
+        if mean is None or std is None:
+            return latents
+        try:
+            if len(mean) == 0 or len(std) == 0:
+                return latents
+        except TypeError:
+            return latents
+        try:
+            m = torch.tensor(mean, device=latents.device, dtype=torch.float32)
+            s = torch.tensor(std, device=latents.device, dtype=torch.float32)
+            if m.numel() == latents.shape[1]:
+                m, s = m.view(1, -1, 1), s.view(1, -1, 1)
+            elif m.numel() == latents.shape[0] * latents.shape[1]:
+                m, s = m.view(latents.shape[0], -1, 1), s.view(latents.shape[0], -1, 1)
+            else:
+                return latents
+            return (latents.float() * s + m).to(latents.dtype)
+        except Exception:
+            return latents
+
     def _setup_cache(self, prompt, height, width, num_frames, steps, seed, save_every=1, cache_root=None, lora_weights=None, lora_scale=1.0, conditioning=None):
         from weellm.pipelines.video.video_cache import VideoStepCache
         if cache_root is None:
@@ -241,6 +277,14 @@ class WeeVideoPipeline(WeeBasePipeline):
         if not (hasattr(underlying, "_blocks") and hasattr(underlying._blocks, "sub_blocks")):
             return
 
+        # The pipeline object is cached and reused for every run, but the block
+        # hooks are installed only once.  Capture a mutable holder instead of
+        # the callback itself, otherwise run #2 would keep reporting into run
+        # #1's (dead) progress state and the UI would sit at 0/N.
+        holder = self.__dict__.setdefault("_weellm_loop_cb", {})
+        holder["cb"] = step_callback
+        holder["cache"] = video_cache
+
         def _walk(blocks_dict):
             for block in blocks_dict.values():
                 if hasattr(block, "loop_step") and not getattr(block, "_weellm_patched_loop", False):
@@ -270,9 +314,10 @@ class WeeVideoPipeline(WeeBasePipeline):
                             return pipe, state
 
                         pipe, state = orig(pipe, state, i=i, t=t)
-                        cb = step_callback
-                        if cb is None and video_cache is not None:
-                            cb = video_cache.get_step_callback()
+                        cb = holder.get("cb")
+                        if cb is None:
+                            vc = holder.get("cache")
+                            cb = vc.get_step_callback() if vc is not None else None
                         if cb is not None:
                             latents = getattr(state, "latents", None)
                             cb_kwargs = {"latents": latents}
@@ -475,7 +520,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                             
                     with torch.no_grad():
                         _decoded = _vae.decode(_lat, return_dict=False)[0]
-                        _video = _vproc.postprocess_video(_decoded, output_type="pil") if _vproc else _decoded
+                        _video = self._postprocess_decoded_video(_decoded, _vae, kwargs)
                         
                     _audio = None
                     if "audio_latents" in _cached_final and getattr(_underlying, "audio_vae", None) and getattr(_underlying, "vocoder", None):
@@ -612,7 +657,7 @@ class WeeVideoPipeline(WeeBasePipeline):
                     
                     with torch.no_grad():
                         _dec = _vae.decode(_lat, return_dict=False)[0]
-                        _vid = _vproc.postprocess_video(_dec, output_type="pil")
+                        _vid = self._postprocess_decoded_video(_dec, _vae, kwargs)
                         
                     out.frames = _vid
                 except Exception as e:
@@ -632,16 +677,25 @@ class WeeVideoPipeline(WeeBasePipeline):
             _audio_vae = getattr(_underlying, "audio_vae", None)
             _vocoder = getattr(_underlying, "vocoder", None)
             
-            if _audio_vae and _vocoder:
+            if _audio_vae:
                 try:
-                    logger.info("[WeeLLM] Manually decoding audio latents using audio_vae and vocoder...")
+                    logger.info("[WeeLLM] Manually decoding audio latents using audio_vae...")
                     with torch.no_grad():
-                        _audio = _audio.to(_audio_vae.dtype).to(_audio_vae.device)
-                        _mel = _audio_vae.decode(_audio, return_dict=False)[0]
-                        _mel = _mel.to(_vocoder.dtype).to(_vocoder.device)
-                        _audio = _vocoder(_mel)
-                        if isinstance(_audio, tuple): _audio = _audio[0]
-                        _audio = _audio.cpu().float()
+                        _a = _audio.to(_audio_vae.dtype).to(_audio_vae.device)
+                        _a = self._preprocess_audio_latents(_a, _audio_vae)
+                        _dec = _audio_vae.decode(_a, return_dict=False)[0]
+                        if _vocoder is not None:
+                            _mel = _dec.to(_vocoder.dtype).to(_vocoder.device)
+                            _wav = _vocoder(_mel)
+                            if isinstance(_wav, tuple):
+                                _wav = _wav[0]
+                        else:
+                            # MiniMax-H3's audio VAE emits the waveform directly
+                            # (no vocoder); it returns (channels, 1, samples).
+                            _wav = _dec
+                            if _wav.dim() == 3 and _wav.shape[0] > 1:
+                                _wav = _wav.permute(1, 0, 2)
+                        _audio = _wav.cpu().float()
                 except Exception as e:
                     logger.warning(f"Audio manual decoding failed: {e}")
             else:
