@@ -357,6 +357,34 @@ def _snap121(n):
     n = max(9, int(n))
     return max(1, ((n - 1 + 4) // 8) * 8 + 1)
 
+def _default_dtype():
+    """bfloat16 is the quality default, except on pre-Ampere GPUs.
+
+    sm75 (Colab T4) has no memory-efficient SDPA kernel for bf16, so PyTorch
+    falls back to the math backend and materialises the whole attention score
+    matrix.  fp16 has the kernel there, so it is both safer and much faster.
+    """
+    try:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            return 'float16'
+    except Exception:
+        pass
+    return 'bfloat16'
+
+def _effective_dtype(dtype_name):
+    """Return ``(name, torch.dtype)`` the current GPU can actually run fast."""
+    if dtype_name == 'float16':
+        return 'float16', torch.float16
+    try:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            ustatus('T4-class GPU — dtype bfloat16 → float16 (bf16 has no memory-efficient '
+                    'attention kernel before Ampere; the math fallback would need ~78 GiB '
+                    'for a 960x544 / 124-frame clip).')
+            return 'float16', torch.float16
+    except Exception:
+        pass
+    return 'bfloat16', torch.bfloat16
+
 # ── download plan + worker (HF Hub only, real byte progress) ───
 def _cached_plan_bytes(repo, patterns, exclude, ggufs, token):
     """Bytes of this exact plan already sitting in the local HF cache.
@@ -933,7 +961,7 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
     seed = int(seed)
     if seed < 0:
         seed = random.randrange(2 ** 31 - 1)
-    dtype = torch.float16 if dtype_name == 'float16' else torch.bfloat16
+    dtype_name, dtype = _effective_dtype(dtype_name)
     a = dict(prompt=prompt.strip(), neg=(neg or '').strip(), w=int(w), h=int(h), steps=int(steps), guid=float(guid or 0), seed=seed, frames=int(frames), start=start_img,
              lora=None, lora_scale=float(lora_scale or 1.0))
     if (lora or '').strip():
@@ -1099,7 +1127,7 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
             _ex = img.convert('RGB').getextrema()
             _blank = all((mx - mn) == 0 for mn, mx in _ex)
             if _blank:
-                ustatus('WARNING: output is one flat color (classic NaN black-image failure) — re-run with dtype bfloat16.')
+                ustatus('WARNING: output is one flat color (classic NaN failure) — re-run with the other dtype.')
         except Exception:
             pass
     ustatus('done in %.0fs · %.1f s/step · peak %.2f GB · seed %d'
@@ -1108,7 +1136,7 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
     _done_txt = 'Done in %.0fs · peak %.2f GB VRAM · seed %d' % (dt, peak, seed)
     _done_kind = 'ok'
     if _blank:
-        _done_txt += ' — WARNING: output looks blank. Re-run with dtype bfloat16.'
+        _done_txt += ' — WARNING: output looks blank. Re-run with the other dtype.'
         _done_kind = 'err'
     yield status_html(_done_txt, _done_kind), bar_html(100, 'Download — complete'), bar_html(100, gen_state['txt']), _log_text(), gr.update(value=img, visible=img is not None), gr.update(value=vid, visible=vid is not None)
 
@@ -1248,7 +1276,7 @@ with gr.Blocks(title='WeeLLM Studio', analytics_enabled=False, css=GRADIO_CSS, t
             guid_s = _C(gr.Slider, 0, 10, value=0.0, step=0.5, label='Guidance (0 = default)')
         with _C(gr.Row):
             seed_n = _C(gr.Number, value=42, precision=0, label='Seed (−1 = random)')
-            dtype_r = _C(gr.Radio, choices=['bfloat16', 'float16'], value='bfloat16', label='Dtype')
+            dtype_r = _C(gr.Radio, choices=['bfloat16', 'float16'], value=_default_dtype(), label='Dtype')
         with _C(gr.Row):
             vram_s = _C(gr.Slider, 2, 16, value=_auto_vram, step=0.5, label='VRAM budget (GB)')
             ram_s = _C(gr.Slider, 2, 24, value=_auto_ram, step=0.5, label='RAM budget (GB) · weight cache')

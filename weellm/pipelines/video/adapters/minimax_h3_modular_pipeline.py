@@ -14,8 +14,23 @@ logger = logging.getLogger("weellm")
 class WeeMiniMaxPipeline(WeeVideoPipeline):
     
     def __call__(self, prompt: str, **kwargs):
-        # We rely on PyTorch's native SDPA (Flash/MemEfficient) to handle VRAM implicitly,
-        # rather than using slow Python loops.
+        # Pick a safe attention path BEFORE the packed sequence is built.
+        # bf16 on pre-Ampere GPUs has no memory-efficient SDPA kernel, so the
+        # math backend would materialise a [heads, rows, rows] fp32 matrix
+        # (77.6 GiB at 960x544 / 124 frames).  The helper switches to a
+        # bounded, query-chunked pass when that kernel is unavailable.
+        try:
+            from weellm.models.transformers.minimax_h3_attention import configure_for_pipeline
+            configure_for_pipeline(
+                self._pipeline,
+                prompt=prompt,
+                height=int(kwargs.get("height", 544) or 544),
+                width=int(kwargs.get("width", 960) or 960),
+                num_frames=int(kwargs.get("num_frames", 121) or 121),
+            )
+        except Exception as _attn_err:
+            logger.warning("[MiniMax-H3] attention preflight failed (%s) — continuing.", _attn_err)
+
         # 1. Add empty dummy components for audio if missing
         # MiniMax ModularPipeline relies on `audio_vae` for t2va and fl2va,
         # but if we are doing video-only, we might need to bypass it.

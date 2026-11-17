@@ -17,7 +17,10 @@ materializes the streamed layers once, in execution order:
 
 The pipeline releases all residency (release()) on the first diffusion
 forward, so the transformer still streams layer-by-layer with the full budget.
-Set WEELLM_TE_FULL_LOAD=0 to force the legacy streaming behaviour.
+On GPUs with <=16 GB of VRAM (Colab's T4) full-load is auto-disabled: filling
+VRAM with encoder weights there leaves the diffusion pass with too little
+headroom.  Set WEELLM_TE_FULL_LOAD=1 to force full-load, or =0 to force the
+legacy streaming behaviour.
 """
 
 from __future__ import annotations
@@ -166,7 +169,26 @@ class TEFullLoad:
         self._staged = bool(getattr(seeker, "supports_staged_prefetch", False))
 
         self.active = False
-        self.disabled = os.environ.get("WEELLM_TE_FULL_LOAD", "1") == "0"
+        _env = os.environ.get("WEELLM_TE_FULL_LOAD")
+        self.disabled = _env == "0"
+        self.auto_disabled = False
+        # On a 15 GB T4 the full-load tiers fill VRAM with encoder weights
+        # (10.5 GB in the field) and leave diffusion fighting for scraps.
+        # Stream the encoder instead unless the user explicitly forces it.
+        if not self.disabled and _env != "1" and str(device).startswith("cuda") and torch.cuda.is_available():
+            try:
+                total_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+                if total_gb <= 16.0:
+                    self.disabled = True
+                    self.auto_disabled = True
+                    logger.info(
+                        "[TE Full-Load] Auto-disabled on a %.1f GB GPU — the encoder streams "
+                        "layer-by-layer so diffusion keeps the full VRAM budget "
+                        "(set WEELLM_TE_FULL_LOAD=1 to force full-load).",
+                        total_gb,
+                    )
+            except Exception:
+                pass
         self._resident_ids: set = set()   # plain VRAM tier: parameters live on GPU
         self._store: Dict[object, object] = {}  # staged payloads / CPU state dicts
         self._tiers: Dict[object, str] = {}
