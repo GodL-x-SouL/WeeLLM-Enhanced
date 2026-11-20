@@ -423,19 +423,44 @@ class WeeBasePipeline:
         # VAEs often produce artifacts in half-precision due to intermediate activation overflow.
         # If we are running in float16 or bfloat16, upcast the VAE to float32.
         vae_dtype = torch.float32 if effective_dtype in (torch.float16, torch.bfloat16) else effective_dtype
+        # MiniMax-H3's video VAE is a 2.42B-parameter ViT decoder.  At fp32 it
+        # is ~10 GB, so only half the blocks fit in a T4's free VRAM and the
+        # rest stream from disk on every pass.  The checkpoint is published in
+        # fp16 for this reason (ComfyUI ships minimax_h3_video_vae_fp16), so on
+        # a half-precision pipeline decode the video VAE in that same dtype.
+        # The audio VAE stays fp32: it is small and more sensitive.
+        _minimax_video_vae = (
+            str(pipeline_class_name).startswith("MiniMaxH3")
+            and effective_dtype in (torch.float16, torch.bfloat16)
+        )
+        # Remember why a component failed: the adapter can then explain (and
+        # retry) instead of dying on `NoneType.config` after the denoise loop.
+        load_errors = {}
         for vae_key in ["vae", "video_vae", "audio_vae"]:
             if vae_key in index:
                 if vae_key in diffusers_kwargs:
                     continue
                 if not (model_dir_path / vae_key).exists():
                     logger.warning("Directory for %s does not exist, skipping.", vae_key)
+                    load_errors[vae_key] = f"{vae_key}/ directory does not exist"
                     continue
+                key_dtype = effective_dtype if (_minimax_video_vae and vae_key in ("vae", "video_vae")) else vae_dtype
                 try:
                     vae_path_override = diffusers_kwargs.pop(f"{vae_key}_path", None)
-                    lazy_vae = cls._load_vae(model_dir_path, device, vae_dtype, cache_to_ram, subfolder=vae_key, vae_path_override=vae_path_override)
+                    lazy_vae = cls._load_vae(model_dir_path, device, key_dtype, cache_to_ram, subfolder=vae_key, vae_path_override=vae_path_override)
                     diffusers_kwargs[vae_key] = lazy_vae.model
+                    logger.info("      -> %s dtype: %s", vae_key, key_dtype)
                 except Exception as e:
-                    logger.warning("Failed to load %s: %s", vae_key, e)
+                    load_errors[vae_key] = f"{type(e).__name__}: {e}"
+                    try:
+                        import traceback as _tb
+                        _detail = _tb.format_exc()
+                    except Exception:
+                        _detail = ""
+                    logger.warning(
+                        "Failed to load %s from %s: %s\n%s",
+                        vae_key, model_dir_path / vae_key, e, _detail,
+                    )
 
         # ── Step 3: Text Encoders ────────────────────────────────────────
         logger.info("\n[3/4] Preparing Text Encoders ...")
@@ -586,6 +611,17 @@ class WeeBasePipeline:
             pipeline.register_components(**diffusers_kwargs)
         
         pipeline.model_dir = str(model_dir)
+        pipeline._weellm_load_errors = load_errors
+        try:
+            _summary = {}
+            for _name in ("vae", "audio_vae", "transformer", "transformer_ref",
+                          "text_encoder", "video_processor", "vocoder"):
+                if hasattr(pipeline, _name):
+                    _mod = getattr(pipeline, _name, None)
+                    _summary[_name] = type(_mod).__name__ if _mod is not None else "MISSING"
+            logger.info("[WeeLLM] pipeline components: %s", _summary)
+        except Exception:
+            pass
 
         # ── Post-build patches ───────────────────────────────────────────
         cls._patch_execution_device(pipeline, device, te_streamers)
@@ -712,7 +748,7 @@ class WeeBasePipeline:
             except Exception as e:
                 logger.warning("Could not read VAE config.json: %s. Defaulting to AutoencoderKL.", e)
                 
-        if class_name == "AutoencoderKLMiniMaxH3":
+        if class_name.startswith("AutoencoderKLMiniMaxH3") and not class_name.endswith("Audio"):
             from weellm.models.vaes.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3Streamer as VaeStreamer
         else:
             from weellm.models.vaes.autoencoder_kl import AutoencoderKL as VaeStreamer

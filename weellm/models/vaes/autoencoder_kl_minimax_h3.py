@@ -81,6 +81,17 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
         self._hb_thread = None
         self._hb_label = "working"
 
+        # The pipeline receives `streamer.model`, not the streamer itself, so
+        # diffusers would call the raw decode() and skip the pin/plan/cache
+        # path entirely (it kept streaming all 36 blocks per pass).  Bind the
+        # streamer's decode onto the model.  The hooks below keep this object
+        # alive, so this survives the streamer reference being dropped.
+        self._original_model_decode = model.decode
+        try:
+            model.decode = self.decode
+        except Exception as exc:
+            logger.warning("[WeeLLM VAE] Could not bind streamer decode: %s", exc)
+
         self._install_decoder_hooks()
         self._patch_encode()
 
@@ -643,11 +654,35 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
                 report_memory("Before VAE decode")
                 self._decode_t0 = time.time()
                 t0 = self._decode_t0
-                with torch.no_grad():
-                    out = self.model.decode(latents.to(self.dtype), return_dict=False)
-                    # out is a tuple; out[0] is the decoded video tensor
-                    result = out[0] if isinstance(out, (tuple, list)) else out
-                elapsed = time.time() - t0
+
+                def _run_decode():
+                    with torch.no_grad():
+                        out = self._original_model_decode(latents.to(self.dtype), return_dict=False)
+                        # out is a tuple; out[0] is the decoded video tensor
+                        return out[0] if isinstance(out, (tuple, list)) else out
+
+                try:
+                    result = _run_decode()
+                    elapsed = time.time() - t0
+                except torch.cuda.OutOfMemoryError:
+                    # Pinning is an optimisation: if the tiles + pinned blocks
+                    # do not fit, drop the pinned copy and stream block by
+                    # block.  That is much slower but it is the path that
+                    # worked before pinning existed, and losing a finished
+                    # denoise over a decode OOM is worse than a slow decode.
+                    logger.warning(
+                        "    [VAE Streamer] OOM while decoding with %d pinned blocks — "
+                        "releasing them and retrying in streaming mode (slower).",
+                        len(self._pinned_prefixes),
+                    )
+                    self._release_pinned_blocks()
+                    clean_memory(self.device)
+                    report_memory("Before VAE decode retry")
+                    self._hb_label = "decoding (streaming fallback)"
+                    self._decode_t0 = time.time()
+                    t0 = self._decode_t0
+                    result = _run_decode()
+                    elapsed = time.time() - t0
             finally:
                 self._stop_heartbeat()
                 self._release_pinned_blocks()
@@ -685,7 +720,14 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
         dtype: torch.dtype = torch.bfloat16,
         cache_to_ram: bool = False,
     ) -> "AutoencoderKLMiniMaxH3Streamer":
-        from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3
+        try:
+            from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3
+        except ImportError:
+            # The class moved around between diffusers dev builds; the public
+            # export is stable, so use it when the module path is not.
+            import diffusers as _diffusers
+
+            AutoencoderKLMiniMaxH3 = getattr(_diffusers, "AutoencoderKLMiniMaxH3")
 
         vae_dir = Path(vae_dir)
         config_path = vae_dir / "config.json"
@@ -704,7 +746,25 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
         # Strip diffusers metadata keys before passing to constructor
         init_cfg = {k: v for k, v in config.items() if not k.startswith("_")}
         with init_empty_weights():
-            model = AutoencoderKLMiniMaxH3(**init_cfg)
+            try:
+                model = AutoencoderKLMiniMaxH3(**init_cfg)
+            except TypeError as exc:
+                # Newer/older diffusers builds add or remove constructor
+                # arguments.  Dropping only the keys the installed class does
+                # not know keeps the checkpoint loading instead of leaving
+                # `vae=None` for the decode block to trip over.
+                import inspect
+
+                params = inspect.signature(AutoencoderKLMiniMaxH3.__init__).parameters
+                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                    raise
+                filtered = {k: v for k, v in init_cfg.items() if k in params}
+                dropped = sorted(set(init_cfg) - set(filtered))
+                logger.warning(
+                    "  [VAE] %s rejected the config (%s); retrying without %s",
+                    AutoencoderKLMiniMaxH3.__name__, exc, dropped,
+                )
+                model = AutoencoderKLMiniMaxH3(**filtered)
         model.eval()
 
         # Extract latent normalisation stats for the config proxy

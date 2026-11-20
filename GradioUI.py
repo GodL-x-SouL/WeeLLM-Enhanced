@@ -1096,7 +1096,11 @@ def _run_all_inner(task, model_key, quant, token, prompt, neg, w, h, steps, guid
         except Exception as e:
             gbox['error'] = '%s: %s' % (type(e).__name__, str(e))
             ustatus('inference failed — ' + gbox['error'])
-            ustatus(traceback.format_exc(limit=5)[-1500:])
+            # The innermost frames are the useful ones.  `limit=5` kept only
+            # the outer studio frames and cut off the diffusers block that
+            # actually raised, so slices of the tail were all we ever saw.
+            _tb = traceback.format_exc()
+            ustatus('traceback (innermost frames):\n' + _tb[-4000:])
     threading.Thread(target=_infer, daemon=True).start()
     while 'img' not in gbox and 'vid' not in gbox and 'error' not in gbox:
         pct = 100.0 * min(1.0, gstate['step'] / max(1, gstate['total']))
