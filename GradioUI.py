@@ -925,6 +925,8 @@ def _save_video_out(out, entry_label):
     try:
         if hasattr(audio, 'dim') and audio.dim() == 3 and audio.shape[0] == 1:
             audio = audio[0]
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().float().cpu()
     except Exception:
         pass
     _rate = getattr(out, 'sampling_rate', None) or getattr(out, 'audio_rate', None)
