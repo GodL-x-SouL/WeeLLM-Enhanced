@@ -2,6 +2,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import struct
 import threading
 import time
 from pathlib import Path
@@ -33,6 +35,203 @@ _PIN_BATCH_BLOCKS = 4
 _PIN_CACHE_MIN_RATE = 80 << 20
 
 _HEARTBEAT_SECONDS = 15.0
+
+
+# ── checkpoint consistency / self-repair ─────────────────────────
+def _read_safetensors_header(path):
+    """Return ``(header, data_base, file_size)`` for a safetensors shard."""
+    path = Path(path)
+    with open(path, "rb") as f:
+        raw = f.read(8)
+        if len(raw) < 8:
+            raise ValueError("file is too small to be safetensors")
+        (header_size,) = struct.unpack("<Q", raw)
+        if header_size <= 0 or header_size > 64 << 20:
+            raise ValueError(f"implausible header size {header_size}")
+        blob = f.read(header_size)
+        if len(blob) != header_size:
+            raise ValueError("truncated safetensors header")
+        header = json.loads(blob.decode("utf-8"))
+    header.pop("__metadata__", None)
+    return header, 8 + header_size, path.stat().st_size
+
+
+def _vae_shard_problems(vae_dir: Path) -> dict:
+    """Map shard filename -> problem for files that cannot supply the index.
+
+    A key is usable if *any* shard has it: the seeker now resolves indices that
+    point at the wrong shard.  Only keys that no shard contains, unreadable
+    shards, and truncated shards are reported as problems.
+    """
+    vae_dir = Path(vae_dir)
+    index = vae_dir / "diffusion_pytorch_model.safetensors.index.json"
+    if not index.is_file():
+        # Single-file VAEs have no index to disagree with.
+        return {} if any(vae_dir.glob("*.safetensors")) else {
+            str(index.name): "missing index and no safetensors shards"
+        }
+
+    try:
+        weight_map = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
+    except Exception as exc:
+        return {"*": f"unreadable index: {type(exc).__name__}: {exc}"}
+
+    by_shard = {}
+    for key, src in weight_map.items():
+        by_shard.setdefault(src, []).append(key)
+
+    problems = {}
+    headers = {}
+    for src in by_shard:
+        path = vae_dir / src
+        if not path.is_file():
+            problems[src] = "file is missing"
+            continue
+        try:
+            header, data_base, size = _read_safetensors_header(path)
+        except Exception as exc:
+            problems[src] = f"unreadable header: {type(exc).__name__}: {exc}"
+            continue
+        headers[src] = header
+        ends = [
+            header[key]["data_offsets"][1]
+            for key in by_shard[src]
+            if key in header
+        ]
+        if ends and size < data_base + max(ends):
+            problems[src] = (
+                f"truncated ({size} B, needs at least {data_base + max(ends)} B)"
+            )
+
+    global_headers = list(headers.values())
+    absent = {}
+    for key, src in weight_map.items():
+        if key in headers.get(src, {}):
+            continue
+        if any(key in header for header in global_headers):
+            continue  # index drift; the seeker can find it in another shard
+        absent.setdefault(src, []).append(key)
+
+    for src, keys in absent.items():
+        preview = ", ".join(repr(k) for k in keys[:3])
+        problems[src] = (
+            f"{len(keys)} indexed tensor(s) are in no shard at all "
+            f"(e.g. {preview})"
+        )
+    return problems
+
+
+def _repo_id_from_cache_path(path: Path):
+    for part in Path(path).parts:
+        if part.startswith("models--"):
+            return part[len("models--"):].replace("--", "/", 1)
+    return None
+
+
+def _install_downloaded(downloaded: Path, dest: Path) -> None:
+    """Point *dest* at *downloaded* without copying multi-GB shards."""
+    dest = Path(dest)
+    tmp = dest.with_name(dest.name + ".weellm-new")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        os.symlink(str(downloaded), tmp)
+    except OSError:
+        shutil.copy2(downloaded, tmp)
+    os.replace(tmp, dest)
+
+
+def _vae_missing_keys(vae_dir: Path) -> list:
+    """Index keys that no shard header contains at all."""
+    vae_dir = Path(vae_dir)
+    index = vae_dir / "diffusion_pytorch_model.safetensors.index.json"
+    try:
+        weight_map = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
+    except Exception:
+        return []
+    headers = {}
+    for src in set(weight_map.values()):
+        path = vae_dir / src
+        if not path.is_file():
+            continue
+        try:
+            header, _, _ = _read_safetensors_header(path)
+        except Exception:
+            continue
+        headers[src] = header
+    missing = []
+    for key, src in weight_map.items():
+        if key in headers.get(src, {}):
+            continue
+        if any(key in header for header in headers.values()):
+            continue
+        missing.append(key)
+    return missing
+
+
+def _repair_vae_shards(vae_dir: Path, subfolder: str = "vae") -> dict:
+    """Re-download only the VAE shards that disagree with the index.
+
+    Returns the remaining problems (empty when the folder is usable).
+    """
+    vae_dir = Path(vae_dir)
+    problems = _vae_shard_problems(vae_dir)
+    if not problems:
+        return {}
+
+    missing = _vae_missing_keys(vae_dir)
+    structural = any("in no shard at all" not in why for why in problems.values())
+    benign = all(
+        key.lower().endswith(".bias") and "norm" in key.lower()
+        for key in missing
+    )
+    if missing and not structural and benign:
+        logger.warning(
+            "  [VAE] Only neutral normalisation tensor(s) are absent (%s); "
+            "initialising them instead of re-downloading a multi-GB shard.",
+            ", ".join(missing[:4]),
+        )
+        return problems
+
+    repo_id = _repo_id_from_cache_path(vae_dir)
+    logger.warning(
+        "  [VAE] Checkpoint/index mismatch under %s: %s",
+        vae_dir, "; ".join(f"{k}: {v}" for k, v in problems.items()),
+    )
+    if not repo_id:
+        logger.warning(
+            "  [VAE] Cannot tell which Hub repo %s came from; the loader will "
+            "use any shard that contains each tensor.", vae_dir,
+        )
+        return problems
+
+    from huggingface_hub import hf_hub_download
+
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+    for src in list(problems):
+        if src == "*":
+            continue
+        filename = f"{subfolder}/{src}" if subfolder else src
+        try:
+            logger.warning("  [VAE] Re-downloading %s (bad local copy) ...", filename)
+            got = hf_hub_download(
+                repo_id=repo_id, filename=filename, force_download=True, token=token,
+            )
+            _install_downloaded(Path(got), vae_dir / src)
+        except Exception as exc:
+            logger.error("  [VAE] Re-download of %s failed: %s", filename, exc)
+
+    remaining = _vae_shard_problems(vae_dir)
+    if remaining:
+        logger.warning(
+            "  [VAE] Still inconsistent after repair: %s",
+            "; ".join(f"{k}: {v}" for k, v in remaining.items()),
+        )
+    else:
+        logger.info("  [VAE] Checkpoint repaired — index and shards agree again.")
+    return remaining
 
 
 class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
@@ -121,6 +320,52 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
             "      -> [WeeLLM VAE] Installed streaming hooks on %d MiniMax VAE decoder blocks.",
             len(streaming_blocks)
         )
+
+    def _fill_missing_resident(self, keys) -> None:
+        """Initialise resident tensors that the checkpoint simply does not have.
+
+        A mismatch between the index and the shard headers used to be fatal even
+        for a tiny LayerNorm bias.  A zero bias / unit weight is exactly the
+        neutral value for those layers, so use that instead of refusing to
+        decode.  Any non-norm tensor is still a hard error: guessing a conv or
+        attention weight would silently produce garbage video.
+        """
+        if not keys:
+            return
+        params = dict(self.model.named_parameters())
+        buffers = dict(self.model.named_buffers())
+        filled, bad = [], []
+        for key in keys:
+            tensor = params.get(key)
+            if tensor is None:
+                tensor = buffers.get(key)
+            if tensor is None or tensor.device.type != "meta":
+                continue
+            if "norm" not in key.lower():
+                bad.append(key)
+                continue
+            value = 1.0 if key.endswith(".weight") else 0.0
+            target_dtype = self.dtype if tensor.is_floating_point() else tensor.dtype
+            data = torch.full(
+                tuple(tensor.shape), value, device=self.device, dtype=target_dtype,
+            )
+            from accelerate.utils import set_module_tensor_to_device
+
+            set_module_tensor_to_device(
+                self.model, key, self.device, value=data, dtype=target_dtype,
+            )
+            filled.append(key)
+        if bad:
+            raise RuntimeError(
+                "MiniMax VAE checkpoint is missing non-normalisation weights: "
+                + ", ".join(repr(k) for k in bad[:6])
+                + ". Re-download the `vae/` folder."
+            )
+        if filled:
+            logger.warning(
+                "    [VAE] %d tensor(s) absent from the checkpoint were initialised "
+                "to neutral norm values: %s", len(filled), ", ".join(filled[:6]),
+            )
 
     # ── VRAM pinning ──────────────────────────────────────────────
     def _block_bytes(self, block: nn.Module) -> int:
@@ -739,6 +984,14 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
         # Older versions stored a custom 'source_path' key; the standard diffusers
         # config does not have it — fall back to vae_dir itself.
         source_path = vae_dir / config["source_path"] if "source_path" in config else vae_dir
+        if Path(source_path).is_dir():
+            # A stale index/shard mix used to crash the first resident load with
+            # e.g. KeyError('decoder.norm_out.bias').  Check before touching GPU
+            # and re-fetch only the shards that are actually wrong.
+            try:
+                _repair_vae_shards(Path(source_path), subfolder=vae_dir.name or "vae")
+            except Exception as exc:
+                logger.warning("  [VAE] Consistency repair skipped: %s", exc)
         seeker = get_seeker(str(source_path), cache_to_ram=cache_to_ram)
         logger.info("  Found %d VAE tensors across shards.", len(seeker.weight_map))
 
@@ -778,10 +1031,19 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
 
         logger.info("  Step 3/3 -- Loading VAE resident tensors to GPU ...")
         resident_keys = streamer._get_resident_keys()
-        resident_sd   = seeker.get_tensors(resident_keys, device=device, dtype=dtype)
+        try:
+            resident_sd = seeker.get_tensors(
+                resident_keys, device=device, dtype=dtype, allow_missing=True,
+            )
+        except TypeError:
+            # Seekers other than the disk one do not accept allow_missing.
+            resident_sd = seeker.get_tensors(resident_keys, device=device, dtype=dtype)
         for name, tensor in resident_sd.items():
             streamer._place_tensor(name, tensor, device, dtype)
         del resident_sd
+        missing = list(getattr(seeker, "missing_keys", []) or [])
+        if missing:
+            streamer._fill_missing_resident(missing)
 
         # Non-persistent buffers (e.g. decoder.rope.inv_freq) are computed in
         # __init__ under init_empty_weights() and land on CPU — they are NOT in

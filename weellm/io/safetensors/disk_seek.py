@@ -60,6 +60,41 @@ class SafetensorsDiskSeeker(SafetensorsBase):
         super().__init__(model_dir)
         self._parse_index()
         self._cache_ns = id(self)
+        # Populated by get_tensors(): keys that are in the index but not in
+        # any shard header.  Callers that can tolerate a missing tensor read
+        # this instead of getting a KeyError halfway through a load.
+        self.missing_keys: List[str] = []
+
+    def _shard_header(self, src_file: str):
+        return self._read_header(self.model_dir / src_file)[0]
+
+    def _locate_key(self, key: str, claimed: str) -> Optional[str]:
+        """Return the shard that actually contains *key*.
+
+        The weight index and the shard headers normally agree.  A stale or
+        interrupted download can leave them out of sync, and the old code
+        raised ``KeyError`` from the header lookup even though another shard
+        held the tensor.  Prefer the indexed shard, then scan the rest.
+        """
+        try:
+            if key in self._shard_header(claimed):
+                return claimed
+        except Exception:
+            pass  # missing/unreadable claimed shard: try the others below
+
+        for src in sorted(set(self.weight_map.values())):
+            if src == claimed:
+                continue
+            try:
+                if key in self._shard_header(src):
+                    logger.warning(
+                        "[SafetensorsDiskSeeker] Index puts '%s' in %s, but it is "
+                        "in %s — loading it from there.", key, claimed, src,
+                    )
+                    return src
+            except Exception:
+                continue
+        return None
 
     def get_tensors(
         self,
@@ -67,6 +102,7 @@ class SafetensorsDiskSeeker(SafetensorsBase):
         device: str = "cpu",
         dtype: Optional[torch.dtype] = None,
         use_cache: bool = True,
+        allow_missing: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Load the tensors named by *keys* from disk and return them as a dict.
@@ -86,15 +122,30 @@ class SafetensorsDiskSeeker(SafetensorsBase):
         """
         # Group keys by source shard file to minimise file-open overhead.
         by_src: Dict[str, List[str]] = {}
+        self.missing_keys = []
         for key in keys:
             if key not in self.weight_map:
                 raise KeyError(f"Tensor '{key}' not found in model index.")
-            by_src.setdefault(self.weight_map[key], []).append(key)
+            src = self._locate_key(key, self.weight_map[key])
+            if src is None:
+                self.missing_keys.append(key)
+                continue
+            by_src.setdefault(src, []).append(key)
+
+        if self.missing_keys and not allow_missing:
+            preview = ", ".join(repr(k) for k in self.missing_keys[:6])
+            more = "" if len(self.missing_keys) <= 6 else f" (+{len(self.missing_keys) - 6} more)"
+            raise KeyError(
+                f"{len(self.missing_keys)} tensor(s) are in the index but not in "
+                f"any shard header: {preview}{more}. The VAE files are damaged or "
+                f"from a different revision; re-download the model folder."
+            )
 
         result: Dict[str, torch.Tensor] = {}
         for src_file, src_keys in by_src.items():
             filepath = self.model_dir / src_file
             header, data_base = self._read_header(filepath)
+            shard_result: Dict[str, torch.Tensor] = {}
 
             cache = get_raw_cache()
             with open(filepath, "rb") as f:
@@ -104,19 +155,20 @@ class SafetensorsDiskSeeker(SafetensorsBase):
                 # reads; coalescing neighbours into one read is several times
                 # faster on HDD / network / Drive mounts.
                 if not use_cache:
-                    self._read_coalesced(f, filepath, header, data_base, src_keys, result)
+                    self._read_coalesced(f, filepath, header, data_base, src_keys, shard_result)
                 else:
                     for key in src_keys:
                         t = cache.get(self._cache_ns, key)
                         if t is None:
                             t = self._read_one(f, filepath, header, data_base, key)
                             cache.put(self._cache_ns, key, t)
-                        result[key] = t
+                        shard_result[key] = t
 
             # Cast before the host->device copy: the fp32 -> fp16 checkpoints
             # then move half the bytes over PCIe, and the GPU never holds a
             # throwaway fp32 staging copy of the block being pinned.
-            for key, t in list(result.items()):
+            # Only this shard's header is valid for looking up its own keys.
+            for key, t in shard_result.items():
                 dtype_str = header[key]["dtype"]
                 if (
                     dtype is not None
