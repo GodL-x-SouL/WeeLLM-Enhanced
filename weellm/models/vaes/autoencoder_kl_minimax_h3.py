@@ -705,7 +705,10 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
                 pass
         logger.info("    [VAE Streamer] Released %d pinned decoder blocks.", len(self._pinned_prefixes))
         self._pinned_prefixes.clear()
-        clean_memory(self.device)
+        try:
+            clean_memory(self.device)
+        except Exception as exc:
+            logger.warning("    [VAE Streamer] Memory cleanup after release failed: %s", exc)
 
     # ── per-block hooks (streaming fallback) ──────────────────────
     def _block_pre_hook(self, module: nn.Module, args):
@@ -930,13 +933,40 @@ class AutoencoderKLMiniMaxH3Streamer(BaseVAEStreamer):
                     elapsed = time.time() - t0
             finally:
                 self._stop_heartbeat()
-                self._release_pinned_blocks()
+                # Flush every decoder kernel before the pinned buffers are
+                # handed back to the allocator.  Without this, an async CUDA
+                # fault surfaces as a mysterious death right after the last
+                # "Released ..." log line, with no traceback.
+                if str(self.device).startswith("cuda") and torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize(self.device)
+                    except Exception as exc:
+                        logger.warning(
+                            "    [VAE Streamer] CUDA sync after decode failed: %s", exc)
+                # Releasing is best-effort: a failure must not throw away a
+                # finished decode.
+                try:
+                    self._release_pinned_blocks()
+                except Exception as exc:
+                    logger.warning(
+                        "    [VAE Streamer] Could not release pinned blocks: %s", exc)
 
             per_pass = elapsed / max(1, plan["passes"])
+            try:
+                import os as _os
+
+                import psutil
+
+                _ram_note = " · RAM %.1f GB free (process %.1f GB)" % (
+                    psutil.virtual_memory().available / 1e9,
+                    psutil.Process(_os.getpid()).memory_info().rss / 1e9,
+                )
+            except Exception:
+                _ram_note = ""
             report_memory("After VAE decode")
             logger.info(
-                "    [VAE Streamer] decode done in %.1fs (%.2f s/pass): %s",
-                elapsed, per_pass, tuple(result.shape),
+                "    [VAE Streamer] decode done in %.1fs (%.2f s/pass): %s%s",
+                elapsed, per_pass, tuple(result.shape), _ram_note,
             )
 
             if use_cache and cache_file:

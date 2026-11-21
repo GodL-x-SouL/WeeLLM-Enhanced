@@ -1321,6 +1321,17 @@ class WeeBasePipeline:
                 _release_for_vae(getattr(pipeline, "unet", None), "unet")
                 report_memory("Before VAE Decode (After Transformer Offload)")
 
+                # The raw-weight RAM cache can be several GB.  It is pure
+                # speed, but on a 12.7 GB Colab host an 8 GB cache leaves no
+                # room for the decode buffers and the frame postprocess, and
+                # the kernel gets OOM-killed right after the decode finishes.
+                # Drop it when free RAM is low; it will repopulate next run.
+                try:
+                    from weellm.io.ram_cache import clear_ram_cache_if_needed
+                    clear_ram_cache_if_needed(reason="VAE decode")
+                except Exception:
+                    pass
+
                 # Cast float inputs (latents) to VAE's expected dtype
                 tgt_dtype = getattr(self_obj, "dtype", None)
                 if tgt_dtype is not None:
@@ -1328,6 +1339,11 @@ class WeeBasePipeline:
                     kwargs = {k: (v.to(tgt_dtype) if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in kwargs.items()}
 
                 res = original_vae_decode_vram(*args, **kwargs)
+                try:
+                    from weellm.io.ram_cache import clear_ram_cache_if_needed
+                    clear_ram_cache_if_needed(reason="video postprocess")
+                except Exception:
+                    pass
                 report_memory("After VAE Decode (Before GC)")
                 gc.collect()
                 if cuda_available:

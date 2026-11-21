@@ -83,6 +83,53 @@ _VIDEO_MAP = {
     "CogVideoXPipeline":("weellm.pipelines.video.weevideopipeline","WeeVideoPipeline"),
 }
 
+def _frames_to_uint8_cpu(frames: torch.Tensor, chunk: int = 8) -> torch.Tensor:
+    """Convert decoded frames to a compact CPU ``uint8`` ``[T, H, W, C]`` tensor.
+
+    The old path pushed the whole float tensor through ``numpy``/PIL, which
+    allocates ~0.8 GB for the float copy plus roughly twice that inside
+    ``numpy_to_pil``.  On a 12.7 GB Colab host, combined with the raw-weight
+    cache, that was enough to OOM-kill the runtime immediately after a
+    successful VAE decode.  Convert a few frames at a time instead and keep
+    only the 194 MB uint8 result.
+    """
+    if frames.dim() == 5:
+        frames = frames[0]
+    if frames.dim() != 4:
+        return frames
+
+    # diffusers `output_type="pt"` returns [T, C, H, W]; a raw decoder returns
+    # [C, T, H, W]; some callers already hand over [T, H, W, C].
+    if frames.shape[1] == 3:
+        pass                                        # [T, C, H, W]
+    elif frames.shape[-1] == 3:
+        frames = frames.permute(0, 3, 1, 2)         # [T, H, W, C] -> [T, C, H, W]
+    elif frames.shape[0] == 3:
+        frames = frames.permute(1, 0, 2, 3)         # [C, T, H, W] -> [T, C, H, W]
+    else:
+        return frames
+
+    scale = 255.0
+    if frames.is_floating_point():
+        try:
+            if float(frames.detach().max()) > 1.5:
+                scale = 1.0                         # already 0..255 pixels
+        except Exception:
+            pass
+
+    t, c, h, w = frames.shape
+    chunk = max(1, int(chunk))
+    out = torch.empty((t, h, w, c), dtype=torch.uint8)
+    for start in range(0, t, chunk):
+        part = frames[start:start + chunk].detach()
+        if part.is_floating_point():
+            part = (part.float() * scale).clamp_(0, 255).round_().to(torch.uint8)
+        else:
+            part = part.to(torch.uint8)
+        out[start:start + part.shape[0]] = part.permute(0, 2, 3, 1).cpu()
+    return out
+
+
 class WeeVideoResult:
     """
     A unified wrapper for generated video frames and audio (if any),
@@ -95,13 +142,7 @@ class WeeVideoResult:
             
         # Unbatch if it's a 5D tensor [B, C, F, H, W] -> [C, F, H, W]
         if isinstance(frames, torch.Tensor):
-            if frames.dim() == 5:
-                frames = frames[0]
-            # Convert [C, F, H, W] to list of numpy arrays [F, H, W, C] for export
-            if frames.dim() == 4:
-                import numpy as np
-                frames = frames.permute(1, 2, 3, 0).cpu().float().numpy()
-                frames = [np.clip(f * 255.0, 0, 255).astype(np.uint8) if f.max() <= 1.0 else f for f in frames]
+            frames = _frames_to_uint8_cpu(frames)
                 
         self.frames = frames
         self.audio = audio
@@ -118,6 +159,30 @@ class WeeVideoResult:
         except ImportError:
             has_encode = False
             
+        if has_encode and isinstance(self.frames, torch.Tensor):
+            # The MiniMax decode path now hands over a uint8 [T,H,W,C] tensor
+            # instead of a PIL list (see _frames_to_uint8_cpu).  encode_video
+            # streams tensors directly; export_to_video cannot take them.
+            _audio = self.audio
+            if isinstance(_audio, torch.Tensor):
+                _audio = _audio.detach().float().cpu()
+                if _audio.dim() == 3 and _audio.shape[0] == 1:
+                    _audio = _audio[0]
+                if _audio.dim() == 1:
+                    _audio = _audio.unsqueeze(0)
+                if not (_audio.dim() == 2 and _audio.shape[0] in (1, 2)):
+                    _audio = None
+            encode_video(
+                self.frames,
+                fps=final_fps,
+                output_path=filepath,
+                audio=_audio,
+                audio_sample_rate=self.audio_rate,
+                **kwargs,
+            )
+            logger.info(f"Video saved to {filepath} at {final_fps} FPS.")
+            return
+
         if has_encode and self.audio is not None:
             # Format audio correctly (typically requires float CPU tensor)
             _audio = self.audio
@@ -510,6 +575,11 @@ class WeeVideoPipeline(WeeBasePipeline):
                         
                     gc.collect()
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
+                    try:
+                        from weellm.io.ram_cache import clear_ram_cache_if_needed
+                        clear_ram_cache_if_needed(reason="VAE decode")
+                    except Exception:
+                        pass
                     
                     _dev = torch.device(str(self.device))
                     _lat = _cached_latents.to(device=_dev, dtype=_vae.dtype)
@@ -650,6 +720,11 @@ class WeeVideoPipeline(WeeBasePipeline):
                         if _c: _release_component_for_decode(_c, evict_module)
                     gc.collect()
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
+                    try:
+                        from weellm.io.ram_cache import clear_ram_cache_if_needed
+                        clear_ram_cache_if_needed(reason="VAE decode")
+                    except Exception:
+                        pass
                     
                     if user_output_type == "latent":
                         out.frames = _lat
@@ -722,12 +797,22 @@ class WeeVideoPipeline(WeeBasePipeline):
 
         # Return the wrapper if we successfully intercepted frames, otherwise return raw output
         if _frames is not None:
-            return WeeVideoResult(
+            _result = WeeVideoResult(
                 frames=_frames,
                 audio=_audio,
                 default_fps=_fps,
                 audio_rate=_audio_rate,
                 sampling_rate=_audio_rate
             )
-            
+            # `WeeVideoResult` holds a compact CPU copy now.  Drop the full
+            # float tensor from the modular pipeline state so its VRAM is free
+            # before audio decode / MP4 encoding.
+            try:
+                if isinstance(getattr(out, "values", None), dict):
+                    out.values.pop("videos", None)
+                    out.values.pop("frames", None)
+            except Exception:
+                pass
+            return _result
+
         return out

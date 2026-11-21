@@ -896,6 +896,14 @@ def _run_video(pipe, entry, a, cb, use_cb):
         raise
 def _save_video_out(out, entry_label):
     from diffusers.utils import encode_video
+    # The MP4 encoder streams the frames, but the raw-weight cache may still
+    # be holding several GB of host RAM.  Free it when memory is tight so the
+    # encoder cannot OOM-kill the session after a successful generation.
+    try:
+        from weellm.io.ram_cache import clear_ram_cache_if_needed
+        clear_ram_cache_if_needed(reason="video encode")
+    except Exception:
+        pass
     videos = getattr(out, 'videos', None)
     if videos is None:
         videos = getattr(out, 'video', None)
@@ -934,11 +942,18 @@ def _save_video_out(out, entry_label):
         import torchvision.io
         v = videos
         if isinstance(v, torch.Tensor):
+            if v.dim() == 5:
+                v = v[0]
             if v.dim() == 4 and v.shape[0] == 3:
                 v = v.permute(1, 0, 2, 3)
             if v.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 v = (v * 255).clamp(0, 255).to(torch.uint8)
-            torchvision.io.write_video(path, v.permute(0, 2, 3, 1), fps=24, audio_array=audio, audio_fps=int(_rate), audio_codec='aac')
+            # torchvision wants [T, H, W, C].  A [T, C, H, W] tensor must be
+            # permuted; the uint8 frames WeeVideoResult produces are already
+            # channels-last and used to be permuted a second time here.
+            if v.dim() == 4 and v.shape[-1] != 3:
+                v = v.permute(0, 2, 3, 1)
+            torchvision.io.write_video(path, v.contiguous(), fps=24, audio_array=audio, audio_fps=int(_rate), audio_codec='aac')
         else:
             raise
     return path

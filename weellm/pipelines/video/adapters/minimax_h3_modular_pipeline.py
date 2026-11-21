@@ -433,6 +433,13 @@ class WeeMiniMaxPipeline(WeeVideoPipeline):
         if _step_cb is not None:
             kwargs["_weellm_step_callback"] = _step_cb
         
+        # The modular decode block defaults to `output_type="pil"`, which
+        # converts the whole 124-frame float tensor to numpy and then to PIL
+        # (several GB of host RAM at 960x544).  On a 12.7 GB Colab host that
+        # OOM-killed the kernel right after a successful decode.  Ask for a
+        # tensor instead; WeeVideoResult converts it to uint8 in small chunks.
+        kwargs.setdefault("output_type", "pt")
+
         # 3. Delegate to the shared generic video generation loop in the base class
         return super().__call__(prompt=prompt, **kwargs)
 

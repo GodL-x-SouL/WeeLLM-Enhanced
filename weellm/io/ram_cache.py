@@ -146,6 +146,42 @@ def clear_ram_cache() -> None:
     _GLOBAL_CACHE.clear()
 
 
+def clear_ram_cache_if_needed(
+    reserve_bytes: int = 5 * 1024**3, reason: str = ""
+) -> int:
+    """Drop cached raw weights when host RAM is nearly exhausted.
+
+    The cache is a pure speed layer: every entry can be re-read from disk.
+    Keeping it when the host is about to run out of memory kills the whole
+    session -- Colab's free tier has ~12.7 GB, the studio's default budget is
+    8 GB, and the decode/postprocess copies then push the kernel over the
+    edge.  ``available`` already counts the cache as used, so a low value is
+    exactly the signal we want.
+
+    Returns the number of bytes released (0 when the cache was kept).
+    """
+    used = _GLOBAL_CACHE.used_bytes
+    if used <= 0:
+        return 0
+    try:
+        import psutil
+
+        available = psutil.virtual_memory().available
+    except Exception:
+        return 0
+    if available >= reserve_bytes:
+        return 0
+    clear_ram_cache()
+    logger.info(
+        "[WeeLLM] Host RAM low (%.1f GB free) — released %.1f GB of cached "
+        "raw weights%s.  They will be re-read if needed.",
+        available / 1e9,
+        used / 1e9,
+        f" ({reason})" if reason else "",
+    )
+    return used
+
+
 def auto_ram_cache_budget() -> int:
     """Conservative raw-cache budget for small hosts (Colab/Kaggle).
 
